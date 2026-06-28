@@ -2226,7 +2226,19 @@ function renderBracketView(){
   }
 
   const matches = ST.bracketSchedule.filter(b=>b.round===ST.activeBracketRound);
-  const tabSlotsForRound = (ST.bracketTabSlots||[]).filter(t=>t.round===ST.activeBracketRound);
+  let tabSlotsForRound = (ST.bracketTabSlots||[]).filter(t=>t.round===ST.activeBracketRound);
+  // Compatibilité : si le bracket a été généré avant l'ajout du T.A.B. après
+  // la finale, on le reconstitue ici à l'affichage (sans toucher aux
+  // données sauvegardées) pour qu'il apparaisse aussi sur les tournois déjà en cours.
+  if(ST.activeBracketRound===3 && matches.length){
+    const maxMatchSlot = Math.max(...matches.map(b=>b.slot));
+    if(!tabSlotsForRound.some(t=>t.slot>maxMatchSlot)){
+      const lastMatch = matches.find(b=>b.slot===maxMatchSlot);
+      const dur = (ST.cfg.matchDurBracket||ST.cfg.matchDur||0)+(ST.cfg.tt||0);
+      const virtualTime = lastMatch && lastMatch.time ? addMinutes(lastMatch.time, dur) : null;
+      tabSlotsForRound = [...tabSlotsForRound, { round:3, slot:maxMatchSlot+1, time:virtualTime }];
+    }
+  }
   const listEl = document.getElementById('bracketMatchList');
   if(listEl){
     if(!matches.length){
