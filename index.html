@@ -395,7 +395,7 @@ window.enterLiveModeAndGo = async function(target){
   // Même logique que spectatorGoLive : relecture fraîche avant de vérifier
   // liveOpen, pour ne pas rester bloqué sur un état périmé (listener lent).
   try {
-    const snap = await getDoc(doc(db,'foottournoi','current'));
+    const snap = await getDoc(doc(db,'foottournoi24','current'));
     if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
   } catch(e){ console.warn('enterLiveModeAndGo: relecture liveOpen échouée', e); }
   if(target !== 'R' && !ST.liveOpen){
@@ -476,7 +476,7 @@ let liveWatchIv = null; // polling de secours (mobile en veille)
 function startLiveWatch(){
   if(unsubLiveWatch) return; // déjà actif
   // Listener temps réel sur foottournoi/status (toujours lisible publiquement).
-  unsubLiveWatch = onSnapshot(doc(db,'foottournoi','status'), (snap)=>{
+  unsubLiveWatch = onSnapshot(doc(db,'foottournoi24','status'), (snap)=>{
     if(!snap.exists()) return;
     handleLiveOpenChange(snap.data().liveOpen === true);
   }, (e)=>{ console.warn('startLiveWatch', e); });
@@ -488,7 +488,7 @@ function startLiveWatch(){
   if(!liveWatchIv){
     liveWatchIv = setInterval(async ()=>{
       try {
-        const snap = await getDoc(doc(db,'foottournoi','status'));
+        const snap = await getDoc(doc(db,'foottournoi24','status'));
         if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
       } catch(e){ /* silencieux : réseau indisponible */ }
     }, 4000);
@@ -514,7 +514,7 @@ document.addEventListener('visibilitychange', async ()=>{
   // On lit foottournoi/status (toujours lisible) pour détecter liveOpen,
   // même si current est illisible pour un spectateur quand liveOpen=false.
   try {
-    const snap = await getDoc(doc(db,'foottournoi','status'));
+    const snap = await getDoc(doc(db,'foottournoi24','status'));
     if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
   } catch(e){ console.warn('resync visibilitychange', e); }
 });
@@ -527,7 +527,7 @@ function subscribeToTournament(){
   // foottournoi/status pour détecter la fermeture du live même quand
   // foottournoi/current devient illisible (liveOpen=false).
   if(!unsubLiveWatch || !liveWatchIv) startLiveWatch();
-  unsubTournament = onSnapshot(doc(db,'foottournoi','current'), (snap)=>{
+  unsubTournament = onSnapshot(doc(db,'foottournoi24','current'), (snap)=>{
     if(!snap.exists()) return;
     const data=snap.data();
     if(data.cfg)             ST.cfg             = data.cfg;
@@ -548,12 +548,12 @@ function subscribeToTournament(){
 async function saveTournament(partial){
   if(!isAdmin() && !isScorer()) return;
   try {
-    await setDoc(doc(db,'foottournoi','current'), { ...partial, updatedAt: serverTimestamp() }, { merge:true });
+    await setDoc(doc(db,'foottournoi24','current'), { ...partial, updatedAt: serverTimestamp() }, { merge:true });
     // Si liveOpen est dans la mise à jour, on le duplique dans foottournoi/status
     // (document toujours lisible publiquement) pour que les spectateurs reçoivent
     // la fermeture du live même quand current devient illisible pour eux.
     if('liveOpen' in partial){
-      await setDoc(doc(db,'foottournoi','status'), { liveOpen: partial.liveOpen }, { merge:true });
+      await setDoc(doc(db,'foottournoi24','status'), { liveOpen: partial.liveOpen }, { merge:true });
     }
   }
   catch(e){ console.error('saveTournament', e); alert('Erreur de sauvegarde : '+e.message); }
@@ -582,7 +582,7 @@ const MAX_PLAYERS = 10;
 function subscribeToRoster(teamId){
   if(unsubRoster){ unsubRoster(); unsubRoster=null; }
   if(!teamId) return;
-  unsubRoster = onSnapshot(doc(db,'teamRosters',teamId), (snap)=>{
+  unsubRoster = onSnapshot(doc(db,'teamRosters24',teamId), (snap)=>{
     ROSTERS[teamId] = snap.exists() ? snap.data() : { players: [] };
     if(ST.page==='M') renderManagerPage();
   }, (e)=>{ console.error('subscribeToRoster', e); });
@@ -591,7 +591,7 @@ function subscribeToRoster(teamId){
 async function getRosterOnce(teamId){
   if(ROSTERS[teamId]) return ROSTERS[teamId];
   try {
-    const snap = await getDoc(doc(db,'teamRosters',teamId));
+    const snap = await getDoc(doc(db,'teamRosters24',teamId));
     const data = snap.exists() ? snap.data() : { players: [] };
     ROSTERS[teamId] = data;
     return data;
@@ -609,7 +609,7 @@ function emptyPlayer(){ return { nom:'', prenom:'', licence:'' }; }
 async function saveRoster(teamId, players){
   if(!isAdmin() && !isScorer() && !(isManager() && MANAGER_TEAM_ID===teamId)) return;
   try {
-    await setDoc(doc(db,'teamRosters',teamId), { players, updatedAt: serverTimestamp() }, { merge:true });
+    await setDoc(doc(db,'teamRosters24',teamId), { players, updatedAt: serverTimestamp() }, { merge:true });
     ROSTERS[teamId] = { players };
   } catch(e){
     console.error('saveRoster', e);
@@ -1335,7 +1335,7 @@ window.spectatorGoLive = async function(n){
   // connexion WebSocket en veille). Ce getDoc garantit qu'on a l'état réel
   // au moment du tap, sans attendre la prochaine notification du listener.
   try {
-    const snap = await getDoc(doc(db,'foottournoi','current'));
+    const snap = await getDoc(doc(db,'foottournoi24','current'));
     if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
   } catch(e){ console.warn('spectatorGoLive: relecture liveOpen échouée', e); }
   if(n!=='R' && isLiveBlocked()){
@@ -1765,7 +1765,7 @@ window.addTeam = async function(){
   // Crée le doc teamRosters vide associé : nécessaire pour que le futur responsable
   // d'équipe (manager) puisse ensuite faire un update (et non un create, qui lui
   // est interdit par les règles Firestore) lors de sa 1ère sauvegarde de joueurs.
-  try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
+  try { await setDoc(doc(db,'teamRosters24',id), { players: [], updatedAt: serverTimestamp() }); }
   catch(e){ console.warn('Création teamRosters initiale échouée (non bloquant)', e); }
   ['t_name','t_club','t_resp','t_tel'].forEach(fid=>{ const el=document.getElementById(fid); if(el) el.value=''; });
   renderTeamsPage();
@@ -1801,7 +1801,7 @@ window.autoFillTeams = async function(){
   }
   await saveTournament({ teams: ST.teams });
   // Crée les docs teamRosters vides associés (cf. note dans addTeam()).
-  try { await Promise.all(ST.teams.map(t=>setDoc(doc(db,'teamRosters',t.id), { players: [], updatedAt: serverTimestamp() }))); }
+  try { await Promise.all(ST.teams.map(t=>setDoc(doc(db,'teamRosters24',t.id), { players: [], updatedAt: serverTimestamp() }))); }
   catch(e){ console.warn('Création teamRosters en lot échouée (non bloquant)', e); }
   renderTeamsPage();
 };
