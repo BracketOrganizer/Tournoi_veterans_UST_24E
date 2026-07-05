@@ -65,7 +65,8 @@ let unsubTournament = null;
 let unsubRoster = null;
 let tvCycleIv = null;   // intervalle d'alternance Résultats/Classement en mode Écran
 let tvClockIv = null;   // intervalle de mise à jour de l'horloge en mode Écran
-let tvScrollIv = null;  // intervalle du défilement automatique en mode Écran
+let tvScrollIv = null;  // (obsolète, conservé pour compat clearInterval) intervalle du défilement automatique en mode Écran
+let tvScrollRAF = null; // boucle requestAnimationFrame du défilement automatique (plus fiable que setInterval sur iOS)
 let tvScreenIndex = 0;  // index de l'écran actuellement affiché parmi les écrans disponibles (mode Écran)
 let tvLastPhase = null; // dernière phase connue, pour repartir au 1er écran si poules→finale
 
@@ -2402,34 +2403,49 @@ function startTVAutoScroll(){
   el.scrollTop = startPos;
   tvScrollState = { phase:'pausedTop', since: Date.now() };
   if(getTVSettings().scroll === false) return; // défilement désactivé par l'opérateur
-  const SPEED = 0.7;   // px par tick (≈23 px/s) — lent, pensé pour être lisible
+  const SPEED_PX_PER_SEC = 23; // vitesse de défilement — lent, pensé pour être lisible
   const PAUSE_MS = 2500;
-  tvScrollIv = setInterval(()=>{
-    if(!el.isConnected) return;
+  let lastTs = null;
+  // Safari iOS arrondit/tronque el.scrollTop à l'entier à CHAQUE écriture : si on
+  // accumule en relisant el.scrollTop (qui vaut donc 0 ou 1 pixel près), les
+  // incréments inférieurs à 1px (0,39px/frame ici) sont perdus à chaque image et
+  // le défilement ne bouge jamais. On garde donc notre propre compteur en
+  // virgule flottante, indépendant de ce que le navigateur affiche/arrondit.
+  let scrollPos = startPos;
+  function tick(ts){
+    if(!el.isConnected){ tvScrollRAF = null; return; }
+    if(lastTs === null) lastTs = ts;
+    const dt = ts - lastTs;
+    lastTs = ts;
     const maxScroll = el.scrollHeight - el.clientHeight;
-    if(maxScroll <= 6) return; // tout tient déjà à l'écran, rien à faire défiler
-    const now = Date.now();
-    if(tvScrollState.phase==='pausedTop'){
-      if(now - tvScrollState.since >= PAUSE_MS) tvScrollState = { phase:'scrollingDown', since: now };
-      return;
-    }
-    if(tvScrollState.phase==='pausedBottom'){
-      if(now - tvScrollState.since >= PAUSE_MS){
-        el.scrollTop = 0; // on repart du tout début pour finir par montrer l'ensemble des matchs
-        tvScrollState = { phase:'pausedTop', since: now };
+    if(maxScroll > 6){
+      const now = Date.now();
+      if(tvScrollState.phase==='pausedTop'){
+        if(now - tvScrollState.since >= PAUSE_MS) tvScrollState = { phase:'scrollingDown', since: now };
+      } else if(tvScrollState.phase==='pausedBottom'){
+        if(now - tvScrollState.since >= PAUSE_MS){
+          scrollPos = 0;
+          el.scrollTop = 0; // on repart du tout début pour finir par montrer l'ensemble des matchs
+          tvScrollState = { phase:'pausedTop', since: now };
+        }
+      } else {
+        scrollPos += SPEED_PX_PER_SEC * (dt/1000);
+        if(scrollPos >= maxScroll - 1){
+          scrollPos = maxScroll;
+          el.scrollTop = maxScroll;
+          tvScrollState = { phase:'pausedBottom', since: now };
+        } else {
+          el.scrollTop = scrollPos;
+        }
       }
-      return;
     }
-    // phase 'scrollingDown'
-    el.scrollTop += SPEED;
-    if(el.scrollTop >= maxScroll - 1){
-      el.scrollTop = maxScroll;
-      tvScrollState = { phase:'pausedBottom', since: now };
-    }
-  }, 30);
+    tvScrollRAF = requestAnimationFrame(tick);
+  }
+  tvScrollRAF = requestAnimationFrame(tick);
 }
 function stopTVAutoScroll(){
   if(tvScrollIv){ clearInterval(tvScrollIv); tvScrollIv=null; }
+  if(tvScrollRAF){ cancelAnimationFrame(tvScrollRAF); tvScrollRAF=null; }
 }
 
 function renderTVPage(){
