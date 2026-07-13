@@ -85,6 +85,7 @@ const ST = {
   activePoolRound:0,
   activeBracketRound:1, // 1,2,3
   liveOpen:false,
+  registrationsOpen:false, // ouverture/fermeture de l'inscription en ligne des équipes
   phase:'pools',   // 'pools' | 'bracket' | 'done'
   timerSec:0, timerRun:false, timerMode:'match', timerIv:null,
   referees:[],     // liste des noms d'arbitres disponibles ["Jean D.", ...]
@@ -304,7 +305,14 @@ async function getUserProfile(uid, email){
       if(d.role==='manager' && d.tournament!=='foot24'){
         return { role:'spectator', teamId:null };
       }
-      return { role: d.role || 'spectator', teamId: d.teamId || null };
+      // Même logique pour les inscriptions en attente : un 'registrant' créé
+      // depuis une AUTRE appli (même collection 'users' partagée) ne doit pas
+      // se voir bloqué sur un écran "inscription en attente" ici.
+      if(d.role==='registrant' && d.tournament!=='foot24'){
+        return { role:'spectator', teamId:null };
+      }
+      return { role: d.role || 'spectator', teamId: d.teamId || null,
+        regStatus: d.regStatus || null, teamName: d.teamName || null };
     }
     return { role:'spectator', teamId:null }; // doc inexistant = nouvel utilisateur, rôle par défaut
   } catch(e){
@@ -338,6 +346,10 @@ onAuthStateChanged(auth, async (user)=>{
     const profile = await getUserProfile(user.uid, user.email);
     USER_ROLE = profile.role;
     MANAGER_TEAM_ID = profile.teamId;
+    if(USER_ROLE === 'registrant'){
+      showRegistrantScreen(profile.regStatus, profile.teamName);
+      return;
+    }
     if(USER_ROLE === 'spectator'){
       // ST.liveOpen est déjà tenu à jour en continu par startLiveWatch
       // (actif depuis le chargement de la page), pas besoin d'un nouveau
@@ -446,6 +458,17 @@ window.enterLiveModeAndGo = async function(target){
 // quel que soit l'endroit où l'utilisateur se trouve quand l'admin ouvre
 // le live.
 // ══════════════════════════════════════════════════════════
+// État public des inscriptions (lu depuis foottournoi24/status, accessible
+// même sans connexion) — pilote l'affichage du bouton "S'inscrire" sur
+// l'écran de connexion.
+let PUBLIC_REG_OPEN = false;
+let PUBLIC_REG_SLOTS = 0;
+function handleRegStatusChange(open, slots){
+  PUBLIC_REG_OPEN = open === true;
+  PUBLIC_REG_SLOTS = typeof slots==='number' ? slots : 0;
+  updateRegButtonOnLogin();
+}
+
 function handleLiveOpenChange(nowOpen){
   const wasOpen = ST.liveOpen;
   ST.liveOpen = nowOpen;
@@ -491,7 +514,9 @@ function startLiveWatch(){
   // Listener temps réel sur foottournoi/status (toujours lisible publiquement).
   unsubLiveWatch = onSnapshot(doc(db,'foottournoi24','status'), (snap)=>{
     if(!snap.exists()) return;
-    handleLiveOpenChange(snap.data().liveOpen === true);
+    const d = snap.data();
+    handleLiveOpenChange(d.liveOpen === true);
+    handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
   }, (e)=>{ console.warn('startLiveWatch', e); });
 
   // Polling de secours toutes les 4 secondes : sur mobile, le navigateur peut
@@ -502,7 +527,11 @@ function startLiveWatch(){
     liveWatchIv = setInterval(async ()=>{
       try {
         const snap = await getDoc(doc(db,'foottournoi24','status'));
-        if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+        if(snap.exists()){
+          const d = snap.data();
+          handleLiveOpenChange(d.liveOpen === true);
+          handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
+        }
       } catch(e){ /* silencieux : réseau indisponible */ }
     }, 4000);
   }
@@ -528,7 +557,11 @@ document.addEventListener('visibilitychange', async ()=>{
   // même si current est illisible pour un spectateur quand liveOpen=false.
   try {
     const snap = await getDoc(doc(db,'foottournoi24','status'));
-    if(snap.exists()) handleLiveOpenChange(snap.data().liveOpen === true);
+    if(snap.exists()){
+      const d = snap.data();
+      handleLiveOpenChange(d.liveOpen === true);
+      handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
+    }
   } catch(e){ console.warn('resync visibilitychange', e); }
 });
 
@@ -557,6 +590,8 @@ function subscribeToTournament(){
     if(data.referees)        ST.referees        = Array.isArray(data.referees) ? data.referees : [];
     ST.refereeAssignments = sanitizeRefereeAssignments(data.refereeAssignments);
     ST.teamRefereeAssignments = sanitizeTeamRefereeAssignments(data.teamRefereeAssignments);
+    ST.registrationsOpen = data.registrationsOpen === true;
+    updateRegOpenBtn();
     handleLiveOpenChange(data.liveOpen === true);
     refreshCurrentPage();
   }, (e)=>{ console.warn('subscribeToTournament', e); });
@@ -571,6 +606,13 @@ async function saveTournament(partial){
     if('liveOpen' in partial){
       await setDoc(doc(db,'foottournoi24','status'), { liveOpen: partial.liveOpen }, { merge:true });
     }
+    if('registrationsOpen' in partial || 'teams' in partial || 'cfg' in partial){
+      const slotsLeft = Math.max(0, (ST.cfg.n||24) - (ST.teams||[]).length);
+      await setDoc(doc(db,'foottournoi24','status'), {
+        registrationsOpen: ST.registrationsOpen === true,
+        slotsLeft
+      }, { merge:true });
+    }
   }
   catch(e){ console.error('saveTournament', e); alert('Erreur de sauvegarde : '+e.message); }
 }
@@ -584,6 +626,11 @@ function refreshCurrentPage(){
   if(ST.page==='M') renderManagerPage();
   if(ST.page==='TV') renderTVContent();
   updateLiveToggleBtn(); // le panneau admin (bouton live) est visible en permanence, pas lié à ST.page
+  updateRegOpenBtn();
+  const regPanel = document.getElementById('registrationsPanel');
+  if(regPanel && regPanel.style.display!=='none'){
+    try { loadRegistrations(); } catch(e){ console.error('loadRegistrations (refresh)', e); }
+  }
   updateRefereesBtnVisibility();
   const refPanel = document.getElementById('refereesPanel');
   if(refPanel && refPanel.style.display!=='none'){
@@ -1218,7 +1265,8 @@ window.newTournament = async function(){
   if(!confirm('Nouveau tournoi ? Toutes les données (équipes, poules, scores) seront définitivement supprimées.')) return;
   ST.teams=[]; ST.pools={A:[],B:[],C:[],D:[]}; ST.poolSchedule=[]; ST.bracketSchedule=[];
   ST.results={}; ST.phase='pools'; ST.activeView='pools'; ST.activePoolRound=0; ST.activeBracketRound=1;
-  await saveTournament({ teams:[], pools:{A:[],B:[],C:[],D:[]}, poolSchedule:[], bracketSchedule:[], results:{}, phase:'pools', liveOpen:false });
+  ST.registrationsOpen = false;
+  await saveTournament({ teams:[], pools:{A:[],B:[],C:[],D:[]}, poolSchedule:[], bracketSchedule:[], results:{}, phase:'pools', liveOpen:false, registrationsOpen:false });
   goTo(1);
 };
 
@@ -1228,13 +1276,107 @@ window.newTournament = async function(){
 window.showLogin = function showLogin(){
   document.getElementById('loginScreen').style.display='flex';
   document.getElementById('appScreen').style.display='none';
+  const regScreen = document.getElementById('registrantScreen');
+  if(regScreen) regScreen.style.display='none';
+  updateRegButtonOnLogin();
 }
 function showApp(){
   document.getElementById('loginScreen').style.display='none';
   document.getElementById('appScreen').style.display='block';
+  const regScreen = document.getElementById('registrantScreen');
+  if(regScreen) regScreen.style.display='none';
   applyRoleUI();
   if(USER_ROLE === 'manager') goTo('M');
 }
+
+// ══════════════════════════════════════════════════════════
+// INSCRIPTION EN LIGNE DES ÉQUIPES
+// ══════════════════════════════════════════════════════════
+function updateRegButtonOnLogin(){
+  const btn = document.getElementById('regOpenBtnLogin');
+  if(!btn) return;
+  const show = PUBLIC_REG_OPEN && PUBLIC_REG_SLOTS>0;
+  btn.style.display = show ? '' : 'none';
+  const full = document.getElementById('regFullNotice');
+  if(full) full.style.display = (PUBLIC_REG_OPEN && PUBLIC_REG_SLOTS<=0) ? '' : 'none';
+}
+
+window.openRegForm = function(){
+  const m = document.getElementById('regFormModal');
+  if(m) m.style.display='flex';
+};
+window.closeRegForm = function(){
+  const m = document.getElementById('regFormModal');
+  if(m) m.style.display='none';
+  const msg = document.getElementById('regFormMsg');
+  if(msg) msg.textContent='';
+};
+
+window.submitRegistration = async function(){
+  const teamName = document.getElementById('reg_team')?.value.trim();
+  const contactName = document.getElementById('reg_contact')?.value.trim();
+  const email = document.getElementById('reg_email')?.value.trim();
+  const phone = document.getElementById('reg_phone')?.value.trim();
+  const pwd = document.getElementById('reg_pwd')?.value;
+  const pwd2 = document.getElementById('reg_pwd2')?.value;
+  const msgEl = document.getElementById('regFormMsg');
+  const setMsg = (t,c)=>{ if(msgEl){ msgEl.textContent=t; msgEl.style.color = c==='red'?'#c0281a':'#1a7a3a'; } };
+
+  if(!teamName || !contactName || !email || !phone || !pwd){ setMsg('Merci de remplir tous les champs.','red'); return; }
+  if(pwd.length<6){ setMsg('Le mot de passe doit faire au moins 6 caractères.','red'); return; }
+  if(pwd!==pwd2){ setMsg('Les deux mots de passe ne correspondent pas.','red'); return; }
+
+  const btn = document.getElementById('regSubmitBtn');
+  if(btn) btn.disabled = true;
+  try {
+    const cred = await createUserWithEmailAndPassword(auth, email, pwd);
+    await setDoc(doc(db,'users',cred.user.uid), {
+      email, name: contactName, role:'registrant', tournament:'foot24',
+      teamName, phone, regStatus:'pending', createdAt: serverTimestamp()
+    }, { merge:true });
+    closeRegForm();
+  } catch(e){
+    console.error('submitRegistration', e);
+    setMsg(authErrMsg ? authErrMsg(e.code) : ('Erreur : '+e.message), 'red');
+  } finally {
+    if(btn) btn.disabled = false;
+  }
+};
+
+function showRegistrantScreen(regStatus, teamName){
+  document.getElementById('loginScreen').style.display='none';
+  document.getElementById('appScreen').style.display='none';
+  let el = document.getElementById('registrantScreen');
+  if(!el){
+    el = document.createElement('div');
+    el.id = 'registrantScreen';
+    el.style.cssText = 'position:fixed;inset:0;z-index:600;background:var(--bg,#0d1a12);display:flex;align-items:center;justify-content:center;padding:24px';
+    document.body.appendChild(el);
+  }
+  const rejected = regStatus === 'rejected';
+  el.innerHTML = `
+    <div style="background:#fff;border-radius:16px;padding:32px 26px;max-width:400px;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.35)">
+      <div style="font-size:48px;margin-bottom:10px">${rejected ? '❌' : '⏳'}</div>
+      <div style="font-family:'Oswald',sans-serif;font-size:19px;color:#1a2540;margin-bottom:8px">
+        ${rejected ? 'Inscription non retenue' : 'Inscription bien reçue'}
+      </div>
+      <div style="font-size:13px;color:#666;margin-bottom:18px">
+        ${teamName ? `Équipe : <strong>${teamName}</strong><br>` : ''}
+        ${rejected
+          ? "Votre inscription n'a malheureusement pas été retenue par l'organisation. Contactez-la pour plus de détails."
+          : "Votre inscription est en attente de validation par l'organisation. Revenez plus tard pour vérifier si elle a été acceptée."}
+      </div>
+      <button onclick="signOutRegistrant()" style="padding:9px 22px;background:#1a7a3a;color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:'Oswald',sans-serif;font-size:14px">Se déconnecter</button>
+    </div>`;
+  el.style.display='flex';
+}
+window.signOutRegistrant = async function(){
+  try { await signOut(auth); } catch(e){ console.error(e); }
+  const el = document.getElementById('registrantScreen');
+  if(el) el.style.display='none';
+  showLogin();
+};
+
 function roleBadge(role){
   const map={admin:'👑 Admin',scorer:'✏️ Scorer (saisie scores)',manager:'🛡️ Responsable équipe',spectator:'👁 Spectateur'};
   return map[role]||role;
@@ -1262,6 +1404,8 @@ function applyRoleUI(){
   updateFwdBtn();
   updateRefereesBtnVisibility();
   updateTeamRefBtnVisibility();
+  updateRegOpenBtn();
+  if(isAdmin()){ try{ loadRegistrations(); }catch(e){} }
   updateBackFwdLabels();
   syncDrawerButtons();
 }
@@ -1423,6 +1567,122 @@ function updateLiveToggleBtn(){
   btn.style.borderColor = ST.liveOpen ? 'var(--grn)' : 'var(--red)';
 }
 
+window.toggleRegistrationsOpen = async function(){
+  if(!isAdmin()) return;
+  const newVal = !ST.registrationsOpen;
+  ST.registrationsOpen = newVal;
+  updateRegOpenBtn();
+  await saveTournament({ registrationsOpen: newVal });
+};
+function updateRegOpenBtn(){
+  const btn=document.getElementById('regToggleBtn');
+  if(!btn) return;
+  const slotsLeft = Math.max(0, (ST.cfg.n||24) - (ST.teams||[]).length);
+  btn.textContent = ST.registrationsOpen
+    ? `🟢 Inscriptions ouvertes (${slotsLeft} place${slotsLeft>1?'s':''} restante${slotsLeft>1?'s':''})`
+    : '🔴 Inscriptions fermées';
+  btn.style.background = ST.registrationsOpen ? 'var(--grn-bg)' : 'var(--red-bg)';
+  btn.style.color = ST.registrationsOpen ? 'var(--grn)' : 'var(--red)';
+  btn.style.borderColor = ST.registrationsOpen ? 'var(--grn)' : 'var(--red)';
+}
+
+// ── Panneau admin de gestion des inscriptions en attente ────────────────
+window.toggleRegistrationsPanel = function(){
+  if(!isAdmin()) return;
+  const p=document.getElementById('registrationsPanel');
+  if(!p) return;
+  const show = p.style.display==='none' || getComputedStyle(p).display==='none';
+  p.style.display = show ? '' : 'none';
+  if(show) loadRegistrations();
+};
+
+window.loadRegistrations = async function(){
+  if(!isAdmin()) return;
+  const el=document.getElementById('registrationsList');
+  if(el) el.innerHTML='<div class="info info-b" style="font-size:12px">Chargement…</div>';
+  try {
+    const snap = await getDocs(collection(db,'users'));
+    const regs=[];
+    snap.forEach(d=>{
+      const u = d.data();
+      if(u.role==='registrant' && u.tournament==='foot24') regs.push({ id:d.id, ...u });
+    });
+    regs.sort((a,b)=>{
+      if((a.regStatus==='pending')!==(b.regStatus==='pending')) return a.regStatus==='pending' ? -1 : 1;
+      return (b.createdAt?.seconds||0)-(a.createdAt?.seconds||0);
+    });
+    renderRegistrationsPanel(regs);
+    updateRegBadge(regs.filter(r=>r.regStatus==='pending').length);
+  } catch(e){
+    console.error('loadRegistrations', e);
+    if(el) el.innerHTML=`<div class="info info-r" style="font-size:12px">Erreur de chargement : ${e.message}</div>`;
+  }
+};
+
+function updateRegBadge(pendingCount){
+  const btn = document.getElementById('regPanelBtn');
+  if(!btn) return;
+  btn.textContent = pendingCount>0 ? `📝 Inscriptions (${pendingCount})` : '📝 Inscriptions';
+}
+
+function renderRegistrationsPanel(regs){
+  const el=document.getElementById('registrationsList'); if(!el) return;
+  if(!regs.length){ el.innerHTML='<div class="info info-y" style="font-size:12px">Aucune inscription pour le moment.</div>'; return; }
+  const slotsLeft = Math.max(0, (ST.cfg.n||24) - (ST.teams||[]).length);
+  el.innerHTML = regs.map(r=>{
+    const statusBadge = r.regStatus==='rejected'
+      ? `<span style="font-size:11px;font-weight:700;color:var(--red)">❌ Refusée</span>`
+      : r.regStatus==='approved'
+        ? `<span style="font-size:11px;font-weight:700;color:var(--grn)">✅ Validée</span>`
+        : `<span style="font-size:11px;font-weight:700;color:var(--ylw)">⏳ En attente</span>`;
+    const canApprove = r.regStatus==='pending' && slotsLeft>0;
+    return `<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--bdr);font-size:13px;flex-wrap:wrap">
+      <div style="flex:1;min-width:180px">
+        <div style="font-weight:700;color:var(--ink)">${r.teamName||'?'}</div>
+        <div style="font-size:11px;color:var(--muted)">🛡️ ${r.name||'?'} · 📧 ${r.email||'?'} · 📞 ${r.phone||'?'}</div>
+      </div>
+      ${statusBadge}
+      ${r.regStatus==='pending' ? `
+        <button class="btn btn-g btn-xs" ${canApprove?'':'disabled title="Plus de place disponible"'} onclick="approveRegistration('${r.id}')">✅ Valider</button>
+        <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="rejectRegistration('${r.id}')">❌ Refuser</button>
+      ` : `<button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="deleteStaffAccount('${r.id}','${(r.teamName||r.email||r.id).replace(/'/g,"\\'")}');setTimeout(loadRegistrations,400)">🗑 Supprimer la fiche</button>`}
+    </div>`;
+  }).join('');
+}
+
+window.approveRegistration = async function(uid){
+  if(!isAdmin()) return;
+  if(ST.teams.length>=(ST.cfg.n||24)){ alert('Plus de place disponible : le tournoi est déjà complet.'); return; }
+  try {
+    const snap = await getDoc(doc(db,'users',uid));
+    if(!snap.exists()){ alert('Cette inscription est introuvable (peut-être déjà traitée).'); loadRegistrations(); return; }
+    const r = snap.data();
+    const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
+    ST.teams.push({ id, name: r.teamName, club: r.teamName, lv:3, respNom: r.name, respTel: r.phone, respEmail: r.email });
+    await saveTournament({ teams: ST.teams });
+    try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
+    catch(e){ console.warn('Création teamRosters (inscription) échouée (non bloquant)', e); }
+    await updateDoc(doc(db,'users',uid), { role:'manager', teamId:id, tournament:'foot24', regStatus:'approved' });
+    renderTeamsPage();
+    loadRegistrations();
+  } catch(e){
+    console.error('approveRegistration', e);
+    alert('Erreur lors de la validation : '+e.message);
+  }
+};
+
+window.rejectRegistration = async function(uid){
+  if(!isAdmin()) return;
+  if(!confirm('Refuser cette inscription ?')) return;
+  try {
+    await updateDoc(doc(db,'users',uid), { regStatus:'rejected' });
+    loadRegistrations();
+  } catch(e){
+    console.error('rejectRegistration', e);
+    alert('Erreur : '+e.message);
+  }
+};
+
 // ══════════════════════════════════════════════════════════
 // GESTION DU STAFF — changer les rôles (admin / scorer / spectator)
 // ══════════════════════════════════════════════════════════
@@ -1454,7 +1714,11 @@ window.loadUsersList = async function(){
   try {
     const snap = await getDocs(collection(db,'users'));
     const users=[];
-    snap.forEach(d=>users.push({ id:d.id, ...d.data() }));
+    snap.forEach(d=>{
+      const u=d.data();
+      if(u.role==='registrant' && u.tournament==='foot24') return;
+      users.push({ id:d.id, ...u });
+    });
     users.sort((a,b)=>(a.email||'').localeCompare(b.email||''));
     renderUsersList(users);
   } catch(e){
@@ -3806,6 +4070,12 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
       </div>
     </div>
 
+    <!-- ══ ZONE INSCRIPTION ÉQUIPE ══ -->
+    <button id="regOpenBtnLogin" onclick="openRegForm()" style="display:none;width:100%;padding:14px 10px;background:linear-gradient(135deg,#7a3ab0,#a050d0);border:2px solid #c090ff;border-radius:12px;color:#fff;font-family:'Oswald',sans-serif;font-size:16px;letter-spacing:.6px;cursor:pointer;text-transform:uppercase;margin-bottom:18px">
+      📝 Inscrire mon équipe au tournoi
+    </button>
+    <div id="regFullNotice" style="display:none;text-align:center;font-size:12px;color:rgba(255,255,255,.6);margin-bottom:18px">📝 Les inscriptions sont complètes.</div>
+
     <!-- ══ ZONE STAFF ══ -->
     <div style="background:var(--s2);border:2px solid var(--bdr2);border-radius:14px;padding:16px">
       <div style="font-family:'Oswald',sans-serif;font-size:16px;font-weight:700;letter-spacing:1px;color:var(--ylw);text-align:center;margin-bottom:12px;text-transform:uppercase">🔑 Connexion Staff</div>
@@ -3825,6 +4095,44 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
           Continuer avec Google
         </button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ══ FORMULAIRE D'INSCRIPTION D'ÉQUIPE ══ -->
+<div id="regFormModal" style="display:none;position:fixed;inset:0;z-index:550;background:rgba(0,0,0,.6);align-items:center;justify-content:center;padding:20px;overflow:auto">
+  <div style="background:#fff;border-radius:16px;padding:24px 22px;max-width:420px;width:100%;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+    <div style="font-family:'Oswald',sans-serif;font-size:18px;color:#1a2540;margin-bottom:4px;text-align:center">📝 Inscription au tournoi</div>
+    <div style="font-size:12px;color:#888;text-align:center;margin-bottom:16px">Votre inscription sera examinée par l'organisation avant validation.</div>
+    <div id="regFormMsg" style="text-align:center;font-size:12px;min-height:16px;margin-bottom:8px"></div>
+    <div style="display:flex;flex-direction:column;gap:10px">
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Nom de l'équipe *</label>
+        <input type="text" id="reg_team" placeholder="Ex : FC Les Copains" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Nom du contact *</label>
+        <input type="text" id="reg_contact" placeholder="Ex : Jean Dupont" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Email *</label>
+        <input type="email" id="reg_email" placeholder="contact@email.com" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Téléphone *</label>
+        <input type="tel" id="reg_phone" placeholder="06 12 34 56 78" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Mot de passe *</label>
+        <input type="password" id="reg_pwd" placeholder="6 caractères minimum" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+        <div style="font-size:10px;color:#999;margin-top:2px">Servira à consulter l'état de votre inscription, puis à gérer votre effectif une fois validée.</div>
+      </div>
+      <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Confirmer le mot de passe *</label>
+        <input type="password" id="reg_pwd2" placeholder="6 caractères minimum" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+      </div>
+      <button id="regSubmitBtn" onclick="submitRegistration()" style="width:100%;padding:11px;background:#7a3ab0;color:#fff;border:none;border-radius:8px;cursor:pointer;font-family:'Oswald',sans-serif;font-size:15px;margin-top:6px">✅ Valider mon inscription</button>
+      <button onclick="closeRegForm()" style="width:100%;padding:9px;background:none;border:1px solid #ccc;border-radius:8px;cursor:pointer;font-size:13px;color:#666">Annuler</button>
     </div>
   </div>
 </div>
@@ -3881,13 +4189,23 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
   <div class="admin-panel-ttl">👑 Panneau Admin</div>
   <div class="flex g8 fw">
     <button class="btn btn-g btn-sm" id="liveToggleBtn" onclick="toggleLiveOpen()">🔴 Live fermé (spectateurs)</button>
+    <button class="btn btn-g btn-sm" id="regToggleBtn" onclick="toggleRegistrationsOpen()">🔴 Inscriptions fermées</button>
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('TV')">📺 Mode Écran (affichage)</button>
     <button class="btn btn-b btn-sm" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
+    <button class="btn btn-b btn-sm" id="regPanelBtn" onclick="toggleRegistrationsPanel()">📝 Inscriptions</button>
     <button class="btn btn-b btn-sm" id="refArbitresBtn" onclick="toggleRefereesPanel()">🧑‍⚖️ Gérer les arbitres</button>
     <button class="btn btn-b btn-sm" id="teamRefBtn" onclick="toggleTeamRefPanel()">⚽ Arbitrage par équipe</button>
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('M')">📋 Feuilles d'équipe</button>
     <button class="btn btn-y btn-sm" onclick="resetAllResults()">🔄 Réinitialiser tous les scores</button>
     <button class="btn btn-r btn-sm" onclick="newTournament()">🆕 Nouveau tournoi</button>
+  </div>
+  <div id="registrationsPanel" style="display:none;margin-top:14px;border-top:1px solid var(--bdr);padding-top:14px">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
+      <strong style="font-size:13px">📝 Inscriptions en ligne</strong>
+      <span style="font-size:11px;color:var(--muted)">Validez une inscription pour créer automatiquement l'équipe (le contact devient responsable/manager). Refusez si besoin.</span>
+      <button class="btn btn-ghost btn-xs" onclick="loadRegistrations()">🔄 Actualiser</button>
+    </div>
+    <div id="registrationsList"></div>
   </div>
   <div id="refereesPanel" style="display:none;margin-top:14px;border-top:1px solid var(--bdr);padding-top:14px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
