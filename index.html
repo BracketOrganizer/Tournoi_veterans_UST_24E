@@ -61,6 +61,9 @@ const gProvider = new GoogleAuthProvider();
 let CURRENT_USER = null;
 let USER_ROLE    = null;
 let MANAGER_TEAM_ID = null; // équipe assignée si USER_ROLE === 'manager'
+let MANAGER_EXTRA_TEAM_IDS = []; // autres équipes du même club confiées au même manager (club autorisé à 2 équipes)
+let MANAGER_VIEW_TEAM_ID = null; // équipe actuellement affichée dans "Mon équipe" (parmi MANAGER_TEAM_ID + MANAGER_EXTRA_TEAM_IDS)
+let MANAGER_PENDING_REQUEST = null; // demande de 2e équipe en attente de validation admin, si déposée
 let unsubTournament = null;
 let unsubRoster = null;
 let tvCycleIv = null;   // intervalle d'alternance Résultats/Classement en mode Écran
@@ -97,6 +100,7 @@ const ST = {
   // Arbitrage tournant par les équipes (alternative/complément aux arbitres
   // officiels ci-dessus) : { 'pool-M': teamId, 'bracket-M': teamId, ... }
   teamRefereeAssignments:{},
+  clubOverrides:{},
   cfg:{
     n:24,
     courts:6,            // nombre de terrains (6 pour 24 équipes)
@@ -109,7 +113,8 @@ const ST = {
     draw:'order',          // 'order' | 'random' | 'random-no-club'
     refereesPerCourt:1,    // nombre d'arbitres par terrain (1 à 4)
     refereesEnabled:false,  // active/désactive le système d'arbitres officiels
-    teamRefereeingEnabled:false // active/désactive l'arbitrage tournant par les équipes
+    teamRefereeingEnabled:false, // active/désactive l'arbitrage tournant par les équipes
+    maxTeamsPerClub:0      // 0 = illimité, sinon 1 ou 2 équipes max par club/entreprise
   }
 };
 
@@ -312,7 +317,9 @@ async function getUserProfile(uid, email){
         return { role:'spectator', teamId:null };
       }
       return { role: d.role || 'spectator', teamId: d.teamId || null,
-        regStatus: d.regStatus || null, teamName: d.teamName || null };
+        regStatus: d.regStatus || null, teamName: d.teamName || null,
+        extraTeamIds: Array.isArray(d.extraTeamIds) ? d.extraTeamIds : [],
+        pendingExtraTeamRequest: d.pendingExtraTeamRequest || null };
     }
     return { role:'spectator', teamId:null }; // doc inexistant = nouvel utilisateur, rôle par défaut
   } catch(e){
@@ -346,6 +353,9 @@ onAuthStateChanged(auth, async (user)=>{
     const profile = await getUserProfile(user.uid, user.email);
     USER_ROLE = profile.role;
     MANAGER_TEAM_ID = profile.teamId;
+    MANAGER_EXTRA_TEAM_IDS = profile.extraTeamIds || [];
+    MANAGER_VIEW_TEAM_ID = MANAGER_TEAM_ID;
+    MANAGER_PENDING_REQUEST = profile.pendingExtraTeamRequest || null;
     if(USER_ROLE === 'registrant'){
       showRegistrantScreen(profile.regStatus, profile.teamName);
       return;
@@ -357,7 +367,7 @@ onAuthStateChanged(auth, async (user)=>{
       // entre les deux sources.
       if(!ST.liveOpen){
         await signOut(auth);
-        CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
+        CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null; MANAGER_EXTRA_TEAM_IDS = []; MANAGER_VIEW_TEAM_ID = null; MANAGER_PENDING_REQUEST = null;
         showLogin();
         showAuthMsg('⏰ Le live n\'est pas encore ouvert.', 'red');
         return;
@@ -367,7 +377,7 @@ onAuthStateChanged(auth, async (user)=>{
     subscribeToTournament();
     if(USER_ROLE === 'manager' && MANAGER_TEAM_ID) subscribeToRoster(MANAGER_TEAM_ID);
   } else {
-    CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null;
+    CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null; MANAGER_EXTRA_TEAM_IDS = []; MANAGER_VIEW_TEAM_ID = null; MANAGER_PENDING_REQUEST = null;
     unsubAll(); // relance startLiveWatch() : ST.liveOpen reste à jour en continu
     showLogin();
   }
@@ -590,6 +600,7 @@ function subscribeToTournament(){
     if(data.referees)        ST.referees        = Array.isArray(data.referees) ? data.referees : [];
     ST.refereeAssignments = sanitizeRefereeAssignments(data.refereeAssignments);
     ST.teamRefereeAssignments = sanitizeTeamRefereeAssignments(data.teamRefereeAssignments);
+    ST.clubOverrides = sanitizeClubOverrides(data.clubOverrides);
     ST.registrationsOpen = data.registrationsOpen === true;
     updateRegOpenBtn();
     handleLiveOpenChange(data.liveOpen === true);
@@ -676,11 +687,16 @@ async function getRosterOnce(teamId){
 
 function emptyPlayer(){ return { nom:'', prenom:'', licence:'' }; }
 
+// Vrai si teamId fait partie des équipes gérées par le manager connecté.
+function isMyTeam(teamId){
+  return teamId===MANAGER_TEAM_ID || MANAGER_EXTRA_TEAM_IDS.includes(teamId);
+}
+
 // Sauvegarde la liste des joueurs d'une équipe. Autorisé pour l'admin/scorer
 // (n'importe quelle équipe) ou pour le manager assigné (sa propre équipe seulement,
 // imposé aussi côté règles Firestore).
 async function saveRoster(teamId, players){
-  if(!isAdmin() && !isScorer() && !(isManager() && MANAGER_TEAM_ID===teamId)) return;
+  if(!isAdmin() && !isScorer() && !(isManager() && isMyTeam(teamId))) return;
   try {
     await setDoc(doc(db,'teamRosters24',teamId), { players, updatedAt: serverTimestamp() }, { merge:true });
     ROSTERS[teamId] = { players };
@@ -1314,6 +1330,7 @@ window.closeRegForm = function(){
 
 window.submitRegistration = async function(){
   const teamName = document.getElementById('reg_team')?.value.trim();
+  const club = document.getElementById('reg_club')?.value.trim();
   const contactName = document.getElementById('reg_contact')?.value.trim();
   const email = document.getElementById('reg_email')?.value.trim();
   const phone = document.getElementById('reg_phone')?.value.trim();
@@ -1322,22 +1339,43 @@ window.submitRegistration = async function(){
   const msgEl = document.getElementById('regFormMsg');
   const setMsg = (t,c)=>{ if(msgEl){ msgEl.textContent=t; msgEl.style.color = c==='red'?'#c0281a':'#1a7a3a'; } };
 
-  if(!teamName || !contactName || !email || !phone || !pwd){ setMsg('Merci de remplir tous les champs.','red'); return; }
+  if(!teamName || !club || !contactName || !email || !phone || !pwd){ setMsg('Merci de remplir tous les champs.','red'); return; }
   if(pwd.length<6){ setMsg('Le mot de passe doit faire au moins 6 caractères.','red'); return; }
   if(pwd!==pwd2){ setMsg('Les deux mots de passe ne correspondent pas.','red'); return; }
 
   const btn = document.getElementById('regSubmitBtn');
   if(btn) btn.disabled = true;
+
+  let cred;
   try {
-    const cred = await createUserWithEmailAndPassword(auth, email, pwd);
+    cred = await createUserWithEmailAndPassword(auth, email, pwd);
+  } catch(e){
+    console.error('submitRegistration: création du compte', e);
+    const map = {
+      'auth/email-already-in-use':'Cet email a déjà un compte. Utilisez un autre email ou contactez l\'organisation.',
+      'auth/invalid-email':'Adresse email invalide.',
+      'auth/weak-password':'Mot de passe trop faible (6 caractères minimum).',
+      'auth/operation-not-allowed':'La connexion par email n\'est pas activée sur cette appli (à activer côté organisateur dans Firebase Authentication).',
+      'auth/network-request-failed':'Problème de connexion réseau. Réessayez.',
+    };
+    setMsg(map[e.code] || `Erreur (${e.code||'inconnue'}) : ${e.message}`, 'red');
+    if(btn) btn.disabled = false;
+    return;
+  }
+  try {
     await setDoc(doc(db,'users',cred.user.uid), {
       email, name: contactName, role:'registrant', tournament:'foot24',
-      teamName, phone, regStatus:'pending', createdAt: serverTimestamp()
+      teamName, club, phone, regStatus:'pending', createdAt: serverTimestamp()
     }, { merge:true });
     closeRegForm();
   } catch(e){
-    console.error('submitRegistration', e);
-    setMsg(authErrMsg ? authErrMsg(e.code) : ('Erreur : '+e.message), 'red');
+    console.error('submitRegistration: écriture de la fiche', e);
+    try { await cred.user.delete(); } catch(e2){ console.warn('nettoyage compte orphelin échoué', e2); }
+    if(e.code==='permission-denied'){
+      setMsg("Écriture refusée par les règles Firestore (permission-denied). L'organisateur doit vérifier que les règles de la collection 'users' autorisent bien la création de son propre document par un nouvel utilisateur, avec les champs teamName/club/phone/regStatus/tournament.", 'red');
+    } else {
+      setMsg(`Erreur technique (${e.code||'inconnue'}) : ${e.message}. Merci de transmettre ce message à l'organisation.`, 'red');
+    }
   } finally {
     if(btn) btn.disabled = false;
   }
@@ -1603,16 +1641,18 @@ window.loadRegistrations = async function(){
   try {
     const snap = await getDocs(collection(db,'users'));
     const regs=[];
+    const extraRequests=[];
     snap.forEach(d=>{
       const u = d.data();
       if(u.role==='registrant' && u.tournament==='foot24') regs.push({ id:d.id, ...u });
+      if(u.role==='manager' && u.tournament==='foot24' && u.pendingExtraTeamRequest) extraRequests.push({ id:d.id, ...u });
     });
     regs.sort((a,b)=>{
       if((a.regStatus==='pending')!==(b.regStatus==='pending')) return a.regStatus==='pending' ? -1 : 1;
       return (b.createdAt?.seconds||0)-(a.createdAt?.seconds||0);
     });
-    renderRegistrationsPanel(regs);
-    updateRegBadge(regs.filter(r=>r.regStatus==='pending').length);
+    renderRegistrationsPanel(regs, extraRequests);
+    updateRegBadge(regs.filter(r=>r.regStatus==='pending').length + extraRequests.length);
   } catch(e){
     console.error('loadRegistrations', e);
     if(el) el.innerHTML=`<div class="info info-r" style="font-size:12px">Erreur de chargement : ${e.message}</div>`;
@@ -1625,30 +1665,103 @@ function updateRegBadge(pendingCount){
   btn.textContent = pendingCount>0 ? `📝 Inscriptions (${pendingCount})` : '📝 Inscriptions';
 }
 
-function renderRegistrationsPanel(regs){
+function renderRegistrationsPanel(regs, extraRequests){
   const el=document.getElementById('registrationsList'); if(!el) return;
-  if(!regs.length){ el.innerHTML='<div class="info info-y" style="font-size:12px">Aucune inscription pour le moment.</div>'; return; }
   const slotsLeft = Math.max(0, (ST.cfg.n||24) - (ST.teams||[]).length);
-  el.innerHTML = regs.map(r=>{
+  const listHTML = !regs.length ? '<div class="info info-y" style="font-size:12px">Aucune inscription pour le moment.</div>' : regs.map(r=>{
     const statusBadge = r.regStatus==='rejected'
       ? `<span style="font-size:11px;font-weight:700;color:var(--red)">❌ Refusée</span>`
       : r.regStatus==='approved'
         ? `<span style="font-size:11px;font-weight:700;color:var(--grn)">✅ Validée</span>`
         : `<span style="font-size:11px;font-weight:700;color:var(--ylw)">⏳ En attente</span>`;
-    const canApprove = r.regStatus==='pending' && slotsLeft>0;
+    const club = r.club || r.teamName;
+    const maxPerClub = effectiveClubLimit(club);
+    const clubCount = countTeamsByClub(club);
+    const clubFull = maxPerClub>0 && clubCount>=maxPerClub;
+    const canApprove = r.regStatus==='pending' && slotsLeft>0 && !clubFull;
+    const disabledTitle = clubFull ? 'Limite equipes club atteinte' : 'Plus de place disponible';
+    const clubNorm = club.trim().toLowerCase();
+    const hasOverride = ST.clubOverrides && (clubNorm in ST.clubOverrides);
+    const clubLimitPicker = r.regStatus==='pending' ? `
+        <select style="font-size:11px;padding:3px 6px" onchange="setClubOverride('${club.replace(/'/g,"\\'")}',this.value)" title="Dérogation de limite pour ce club uniquement">
+          <option value="" ${!hasOverride?'selected':''}>Limite club : défaut (${ST.cfg.maxTeamsPerClub||'illimité'})</option>
+          <option value="1" ${hasOverride&&ST.clubOverrides[clubNorm]===1?'selected':''}>Limite club : 1</option>
+          <option value="2" ${hasOverride&&ST.clubOverrides[clubNorm]===2?'selected':''}>Limite club : 2</option>
+        </select>` : '';
     return `<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--bdr);font-size:13px;flex-wrap:wrap">
       <div style="flex:1;min-width:180px">
-        <div style="font-weight:700;color:var(--ink)">${r.teamName||'?'}</div>
+        <div style="font-weight:700;color:var(--ink)">${r.teamName||'?'} <span style="font-weight:400;color:var(--dim);font-size:11px">— ${club}${maxPerClub>0?` (${clubCount}/${maxPerClub})`:''}</span></div>
         <div style="font-size:11px;color:var(--muted)">🛡️ ${r.name||'?'} · 📧 ${r.email||'?'} · 📞 ${r.phone||'?'}</div>
       </div>
+      ${clubLimitPicker}
       ${statusBadge}
       ${r.regStatus==='pending' ? `
-        <button class="btn btn-g btn-xs" ${canApprove?'':'disabled title="Plus de place disponible"'} onclick="approveRegistration('${r.id}')">✅ Valider</button>
+        <button class="btn btn-g btn-xs" ${canApprove?'':`disabled title="${disabledTitle}"`} onclick="approveRegistration('${r.id}')">✅ Valider</button>
         <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="rejectRegistration('${r.id}')">❌ Refuser</button>
       ` : `<button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="deleteStaffAccount('${r.id}','${(r.teamName||r.email||r.id).replace(/'/g,"\\'")}');setTimeout(loadRegistrations,400)">🗑 Supprimer la fiche</button>`}
     </div>`;
   }).join('');
+
+  const extraHTML = (extraRequests && extraRequests.length) ? `
+    <div style="font-weight:700;font-size:12px;margin:14px 0 6px">➕ Demandes de 2ᵉ équipe (club déjà inscrit)</div>
+    ${extraRequests.map(r=>{
+      const team = tObj(r.teamId);
+      const club = team ? team.club : '?';
+      return `<div style="display:flex;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--bdr);font-size:13px;flex-wrap:wrap">
+        <div style="flex:1;min-width:180px">
+          <div style="font-weight:700;color:var(--ink)">${r.pendingExtraTeamRequest.name} <span style="font-weight:400;color:var(--dim);font-size:11px">— club ${club}</span></div>
+          <div style="font-size:11px;color:var(--muted)">🛡️ ${r.name||'?'} · 📧 ${r.email||'?'} (équipe déjà validée : ${team?team.name:'?'})</div>
+        </div>
+        <button class="btn btn-g btn-xs" onclick="approveExtraTeamRequest('${r.id}')">✅ Créer cette équipe</button>
+        <button class="btn btn-ghost btn-xs" style="color:var(--red);border-color:var(--red)" onclick="rejectExtraTeamRequest('${r.id}')">❌ Refuser</button>
+      </div>`;
+    }).join('')}
+  ` : '';
+
+  el.innerHTML = listHTML + extraHTML;
 }
+
+window.approveExtraTeamRequest = async function(uid){
+  if(!isAdmin()) return;
+  if(ST.teams.length>=(ST.cfg.n||24)){ alert('Plus de place disponible : le tournoi est déjà complet.'); return; }
+  try {
+    const snap = await getDoc(doc(db,'users',uid));
+    if(!snap.exists() || !snap.data().pendingExtraTeamRequest){ alert('Cette demande est introuvable (peut-être déjà traitée).'); loadRegistrations(); return; }
+    const u = snap.data();
+    const primaryTeam = tObj(u.teamId);
+    const club = primaryTeam ? primaryTeam.club : (u.club||u.teamName);
+    const maxPerClub = effectiveClubLimit(club);
+    const currentCount = countTeamsByClub(club);
+    if(maxPerClub>0 && currentCount>=maxPerClub){
+      alert(`Refusé : le club "${club}" a déjà atteint sa limite de ${maxPerClub} équipe${maxPerClub>1?'s':''}. Augmentez la limite pour ce club si besoin, avant de valider.`);
+      return;
+    }
+    const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
+    ST.teams.push({ id, name: u.pendingExtraTeamRequest.name, club, lv:3, respNom: u.name, respTel: u.phone, respEmail: u.email });
+    await saveTournament({ teams: ST.teams });
+    try { await setDoc(doc(db,'teamRosters24',id), { players: [], updatedAt: serverTimestamp() }); }
+    catch(e){ console.warn('Création teamRosters (2e équipe) échouée (non bloquant)', e); }
+    const extraTeamIds = [...(u.extraTeamIds||[]), id];
+    await updateDoc(doc(db,'users',uid), { extraTeamIds, pendingExtraTeamRequest: null });
+    renderTeamsPage();
+    loadRegistrations();
+  } catch(e){
+    console.error('approveExtraTeamRequest', e);
+    alert('Erreur lors de la validation : '+e.message);
+  }
+};
+
+window.rejectExtraTeamRequest = async function(uid){
+  if(!isAdmin()) return;
+  if(!confirm('Refuser cette demande de 2e équipe ?')) return;
+  try {
+    await updateDoc(doc(db,'users',uid), { pendingExtraTeamRequest: null });
+    loadRegistrations();
+  } catch(e){
+    console.error('rejectExtraTeamRequest', e);
+    alert('Erreur : '+e.message);
+  }
+};
 
 window.approveRegistration = async function(uid){
   if(!isAdmin()) return;
@@ -1657,10 +1770,16 @@ window.approveRegistration = async function(uid){
     const snap = await getDoc(doc(db,'users',uid));
     if(!snap.exists()){ alert('Cette inscription est introuvable (peut-être déjà traitée).'); loadRegistrations(); return; }
     const r = snap.data();
+    const club = r.club || r.teamName;
+    const maxPerClub = effectiveClubLimit(club);
+    if(maxPerClub>0 && countTeamsByClub(club)>=maxPerClub){
+      alert(`Refusé : le club "${club}" a déjà ${maxPerClub} équipe${maxPerClub>1?'s':''} inscrite${maxPerClub>1?'s':''} (limite actuelle). Vous pouvez changer cette limite pour ce club dans le panneau Inscriptions, ou refuser cette inscription.`);
+      return;
+    }
     const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
-    ST.teams.push({ id, name: r.teamName, club: r.teamName, lv:3, respNom: r.name, respTel: r.phone, respEmail: r.email });
+    ST.teams.push({ id, name: r.teamName, club, lv:3, respNom: r.name, respTel: r.phone, respEmail: r.email });
     await saveTournament({ teams: ST.teams });
-    try { await setDoc(doc(db,'teamRosters',id), { players: [], updatedAt: serverTimestamp() }); }
+    try { await setDoc(doc(db,'teamRosters24',id), { players: [], updatedAt: serverTimestamp() }); }
     catch(e){ console.warn('Création teamRosters (inscription) échouée (non bloquant)', e); }
     await updateDoc(doc(db,'users',uid), { role:'manager', teamId:id, tournament:'foot24', regStatus:'approved' });
     renderTeamsPage();
@@ -1669,6 +1788,41 @@ window.approveRegistration = async function(uid){
     console.error('approveRegistration', e);
     alert('Erreur lors de la validation : '+e.message);
   }
+};
+
+// Compte combien d'équipes existantes appartiennent déjà à ce club (comparaison
+// insensible à la casse/espaces), pour appliquer la limite cfg.maxTeamsPerClub.
+function countTeamsByClub(club){
+  const norm = (club||'').trim().toLowerCase();
+  if(!norm) return 0;
+  return ST.teams.filter(t=>(t.club||'').trim().toLowerCase()===norm).length;
+}
+
+function sanitizeClubOverrides(co){
+  const out = {};
+  if(co && typeof co==='object' && !Array.isArray(co)){
+    Object.keys(co).forEach(k=>{ if(typeof co[k]==='number') out[k]=co[k]; });
+  }
+  return out;
+}
+
+function effectiveClubLimit(club){
+  const norm = (club||'').trim().toLowerCase();
+  if(!norm) return ST.cfg.maxTeamsPerClub||0;
+  if(ST.clubOverrides && norm in ST.clubOverrides) return ST.clubOverrides[norm];
+  return ST.cfg.maxTeamsPerClub||0;
+}
+
+window.setClubOverride = async function(club, value){
+  if(!isAdmin()) return;
+  const norm = (club||'').trim().toLowerCase();
+  if(!norm) return;
+  if(!ST.clubOverrides) ST.clubOverrides = {};
+  if(value===''||value==null){ delete ST.clubOverrides[norm]; }
+  else { ST.clubOverrides[norm] = +value; }
+  await saveTournament({ clubOverrides: ST.clubOverrides });
+  loadRegistrations();
+  renderTeamsPage();
 };
 
 window.rejectRegistration = async function(uid){
@@ -2447,6 +2601,7 @@ function getCfg(){
     refereesPerCourt: Math.min(4,Math.max(1,+(document.getElementById('cfg_refperc')?.value||1))),
     refereesEnabled: !!document.getElementById('cfg_refon')?.checked,
     teamRefereeingEnabled: !!document.getElementById('cfg_teamrefon')?.checked,
+    maxTeamsPerClub: +(document.getElementById('cfg_maxclub')?.value||0),
   };
 }
 function renderCfgForm(){
@@ -2471,6 +2626,7 @@ function renderCfgForm(){
   if(refOnEl) refOnEl.checked = !!c.refereesEnabled;
   const teamRefOnEl = document.getElementById('cfg_teamrefon');
   if(teamRefOnEl) teamRefOnEl.checked = !!c.teamRefereeingEnabled;
+  setV('cfg_maxclub', c.maxTeamsPerClub||0);
   toggleRefPerCourtVisibility();
   _breaksDraft = (c.breaks && c.breaks.length) ? c.breaks.map(b=>({...b})) : [{ time:'12:00', duration:45, label:'Pause déjeuner' }];
   renderBreaksList();
@@ -2562,6 +2718,11 @@ window.addTeam = async function(){
   const respNom = document.getElementById('t_resp').value.trim();
   const respTel = document.getElementById('t_tel').value.trim();
   if(!name){ alert('Le nom de l\'équipe est obligatoire.'); return; }
+  const maxPerClub = effectiveClubLimit(club);
+  if(maxPerClub>0 && countTeamsByClub(club)>=maxPerClub){
+    alert(`Refusé : le club "${club}" a déjà ${maxPerClub} équipe${maxPerClub>1?'s':''} inscrite${maxPerClub>1?'s':''} (limite actuelle réglée pour ce club).`);
+    return;
+  }
   const id = 't_'+Date.now()+'_'+Math.random().toString(36).slice(2,6);
   ST.teams.push({ id, name, club, lv, respNom, respTel });
   await saveTournament({ teams: ST.teams });
@@ -3662,7 +3823,7 @@ function renderTeamsSpecPage(){
 let ADMIN_VIEW_TEAM_ID = null; // équipe choisie par l'admin pour consulter/éditer
 
 function currentRosterTeamId(){
-  return isManager() ? MANAGER_TEAM_ID : ADMIN_VIEW_TEAM_ID;
+  return isManager() ? MANAGER_VIEW_TEAM_ID : ADMIN_VIEW_TEAM_ID;
 }
 
 window.adminPickRosterTeam = function(teamId){
@@ -3670,6 +3831,12 @@ window.adminPickRosterTeam = function(teamId){
   ADMIN_VIEW_TEAM_ID = teamId || null;
   if(ADMIN_VIEW_TEAM_ID){ getRosterOnce(ADMIN_VIEW_TEAM_ID).then(renderManagerPage); }
   else renderManagerPage();
+};
+
+window.managerPickRosterTeam = function(teamId){
+  if(!isManager() || !isMyTeam(teamId)) return;
+  MANAGER_VIEW_TEAM_ID = teamId;
+  getRosterOnce(teamId).then(renderManagerPage);
 };
 
 async function renderManagerPage(){
@@ -3686,6 +3853,17 @@ async function renderManagerPage(){
         <select onchange="adminPickRosterTeam(this.value)" style="margin-top:4px">
           <option value="">— Sélectionner une équipe —</option>
           ${teams.map(t=>`<option value="${t.id}" ${t.id===ADMIN_VIEW_TEAM_ID?'selected':''}>${t.name}</option>`).join('')}
+        </select>`;
+    }
+  } else if(isManager() && MANAGER_EXTRA_TEAM_IDS.length>0){
+    const pickerEl=document.getElementById('managerTeamPicker');
+    if(pickerEl){
+      const myTeamIds=[MANAGER_TEAM_ID, ...MANAGER_EXTRA_TEAM_IDS].filter(Boolean);
+      const myTeams=myTeamIds.map(id=>tObj(id)).filter(Boolean);
+      pickerEl.style.display='';
+      pickerEl.innerHTML = `<label style="font-size:12px;color:var(--muted)">Votre club a plusieurs équipes — choisissez celle à éditer :</label>
+        <select onchange="managerPickRosterTeam(this.value)" style="margin-top:4px">
+          ${myTeams.map(t=>`<option value="${t.id}" ${t.id===MANAGER_VIEW_TEAM_ID?'selected':''}>${t.name}</option>`).join('')}
         </select>`;
     }
   } else {
@@ -3706,6 +3884,24 @@ async function renderManagerPage(){
   // On affiche toujours MAX_PLAYERS lignes (vides si besoin) pour saisie facile.
   const rows = [];
   for(let i=0;i<MAX_PLAYERS;i++) rows.push(players[i] || emptyPlayer());
+
+  let extraTeamSection = '';
+  if(isManager() && team){
+    const myCount = 1 + MANAGER_EXTRA_TEAM_IDS.length;
+    const limit = effectiveClubLimit(team.club);
+    if(MANAGER_PENDING_REQUEST){
+      extraTeamSection = `<div class="info info-y" style="margin-top:16px;font-size:12px">⏳ Demande de 2ᵉ équipe "${MANAGER_PENDING_REQUEST.name}" envoyée, en attente de validation par l'organisation.</div>`;
+    } else if(limit>0 && myCount<limit){
+      extraTeamSection = `
+        <div style="margin-top:16px;padding:12px;background:var(--s2);border:1.5px dashed var(--grn);border-radius:10px">
+          <div style="font-size:12px;font-weight:700;margin-bottom:6px">➕ Votre club (${team.club}) est autorisé à inscrire ${limit} équipes — demander la ${myCount+1===2?'2ᵉ':(myCount+1)+'ᵉ'} :</div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <input type="text" id="extraTeamName" placeholder="Nom de la nouvelle équipe" style="flex:1;min-width:180px">
+            <button class="btn btn-g btn-sm" onclick="requestExtraTeam()">Envoyer la demande</button>
+          </div>
+        </div>`;
+    }
+  }
 
   el.innerHTML = `
     <div class="card-ttl" style="margin-bottom:4px">
@@ -3730,8 +3926,25 @@ async function renderManagerPage(){
     <div class="flex g8 fw mt16">
       <button class="btn btn-g" onclick="submitRoster('${teamId}')">✓ Enregistrer la feuille d'équipe</button>
     </div>
+    ${extraTeamSection}
   `;
 }
+
+window.requestExtraTeam = async function(){
+  if(!isManager()) return;
+  const name = document.getElementById('extraTeamName')?.value.trim();
+  if(!name){ alert('Merci de préciser le nom de la nouvelle équipe.'); return; }
+  try {
+    await updateDoc(doc(db,'users',CURRENT_USER.uid), {
+      pendingExtraTeamRequest: { name, requestedAt: serverTimestamp() }
+    });
+    MANAGER_PENDING_REQUEST = { name };
+    renderManagerPage();
+  } catch(e){
+    console.error('requestExtraTeam', e);
+    alert('Erreur lors de l\'envoi de la demande : '+e.message);
+  }
+};
 
 window.submitRoster = async function(teamId){
   const msgEl=document.getElementById('rosterMsg');
@@ -4111,6 +4324,11 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
         <input type="text" id="reg_team" placeholder="Ex : FC Les Copains" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
       </div>
       <div>
+        <label style="font-size:12px;font-weight:700;color:#333">Club / entreprise *</label>
+        <input type="text" id="reg_club" placeholder="Ex : Club Sportif Alpha" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
+        <div style="font-size:10px;color:#999;margin-top:2px">Si votre club inscrit plusieurs équipes, gardez le même nom de club pour chacune.</div>
+      </div>
+      <div>
         <label style="font-size:12px;font-weight:700;color:#333">Nom du contact *</label>
         <input type="text" id="reg_contact" placeholder="Ex : Jean Dupont" style="width:100%;padding:9px 12px;border:1.5px solid #ccc;border-radius:8px;font-size:14px">
       </div>
@@ -4319,6 +4537,17 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
           <label for="cfg_teamrefon" style="margin:0;cursor:pointer">⚽ Activer l'arbitrage tournant par les équipes</label>
         </div>
         <div style="font-size:10px;color:var(--dim);padding-left:26px;max-width:520px">Poules : arbitrée par une équipe d'une <strong>autre poule</strong>. Phase finale : arbitrée par une équipe <strong>libre à cet horaire</strong>. Jamais sa propre équipe, rotation équilibrée automatique (réglable ensuite).</div>
+      </div>
+      <div class="fr">
+        <div>
+          <label>🏳️ Max. équipes inscrites par club/entreprise</label>
+          <select id="cfg_maxclub" oninput="onCfgChange()">
+            <option value="0">Illimité</option>
+            <option value="1">1 équipe max</option>
+            <option value="2">2 équipes max</option>
+          </select>
+          <div style="font-size:10px;color:var(--dim);margin-top:3px">S'applique à l'inscription en ligne (contrôlé à la validation par l'admin) et à l'ajout manuel d'équipe.</div>
+        </div>
       </div>
       <div class="fr">
         <div>
