@@ -4199,6 +4199,7 @@ window.tmrToggleTvSound = function(){
   tmrMutate(n=>{ n.tvSound = !n.tvSound; });
 };
 window.tmrSetMode = function(mode){
+  if(!isAdmin()) return; // le choix 1 chrono / 1 chrono par terrain est réservé à l'admin
   tmrMutate(n=>{ n.mode = (mode==='perCourt') ? 'perCourt' : 'single'; });
 };
 window.tmrCmd = function(key, action, mode){
@@ -4241,8 +4242,8 @@ function renderTimerPanel(){
   let h = '';
   if(ctl){
     h += `<div class="tmr-top">
-      <button class="btn btn-sm ${!per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('single')">⏱ 1 chrono pour tous les terrains</button>
-      <button class="btn btn-sm ${per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('perCourt')">🏟️ 1 chrono par terrain</button>
+      ${isAdmin() ? `<button class="btn btn-sm ${!per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('single')">⏱ 1 chrono pour tous les terrains</button>
+      <button class="btn btn-sm ${per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('perCourt')">🏟️ 1 chrono par terrain</button>` : ''}
       <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son sur cet appareil">${_soundEnabled?'🔊':'🔇'}</button>
       ${isAdmin() ? `<button class="btn ${ST.timers.tvSound?'btn-g':'btn-ghost'} btn-sm" onclick="tmrToggleTvSound()" title="Active ou coupe la sirène sur l'écran TV">📺 Son TV : ${ST.timers.tvSound?'activé':'coupé'}</button>` : ''}
     </div>`;
