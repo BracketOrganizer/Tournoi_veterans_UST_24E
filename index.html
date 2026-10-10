@@ -599,6 +599,7 @@ document.addEventListener('visibilitychange', ()=>{
       _bgWas = { t:!!unsubTournament, m:!!unsubMessages };
       if(unsubTournament){ unsubTournament(); unsubTournament=null; }
       if(unsubMessages){ unsubMessages(); unsubMessages=null; }
+      if(unsubTimers){ unsubTimers(); unsubTimers = null; }
       stopLiveWatch();
       _bgDetached = true;
     }, BG_DETACH_MS);
@@ -4184,7 +4185,10 @@ function tmrLabel(t){
 
 // Réception de l'état partagé (appelée à chaque lecture de foottournoi24/status)
 function applyTimersFromStatus(d){
-  const tm = d && d.timers;
+  if(d && typeof d==='object') ST.timersMobile = d.timersMobile !== false; // réglage admin : chrono visible sur les mobiles
+  applyTimersObj(d && d.timers);
+}
+function applyTimersObj(tm){
   if(!tm || typeof tm!=='object') return;
   if((tm.v||0) < (ST.timers.v||0)) return; // lecture plus ancienne que notre état local : on ignore
   ST.timers = {
@@ -4223,7 +4227,7 @@ async function tmrMutate(fn){
   next.v = Math.max(Date.now(), (cur.v||0)+1);
   ST.timers = next;          // effet immédiat sur cet appareil
   timerTick();
-  try { await setDoc(doc(db,'foottournoi24','status'), { timers: next }, { merge:true }); }
+  try { await tmrPersist(next); }
   catch(e){
     console.error('tmrMutate', e);
     alert('Chrono non synchronisé : '+e.message+(String(e.code||'').includes('permission') ? '\n\nLes règles Firestore refusent l\'écriture sur foottournoi24/status pour ce compte.' : ''));
@@ -4271,7 +4275,7 @@ function renderTimerPanel(){
   const el = document.getElementById('tmrPanel'); if(!el) return;
   const ctl = isScorer(), per = ST.timers.mode==='perCourt';
   const keys = tmrKeys();
-  const shown = ctl ? keys : keys.filter(k=>tmrGet(k)); // un spectateur ne voit que les chronos lancés
+  const shown = ctl ? keys : (ST.timersMobile===false ? [] : keys.filter(k=>tmrGet(k))); // un spectateur ne voit que les chronos lancés, sauf si l'admin les masque sur mobile
   if(!shown.length){ el.style.display='none'; el.innerHTML=''; return; }
   el.style.display = '';
   let h = '';
@@ -4281,6 +4285,7 @@ function renderTimerPanel(){
       <button class="btn btn-sm ${per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('perCourt')">🏟️ 1 chrono par terrain</button>` : ''}
       <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son sur cet appareil">${_soundEnabled?'🔊':'🔇'}</button>
       ${isAdmin() ? `<button class="btn ${ST.timers.tvSound?'btn-g':'btn-ghost'} btn-sm" onclick="tmrToggleTvSound()" title="Active ou coupe la sirène sur l'écran TV">📺 Son TV : ${ST.timers.tvSound?'activé':'coupé'}</button>` : ''}
+      ${isAdmin() ? `<button class="btn ${ST.timersMobile!==false?'btn-g':'btn-ghost'} btn-sm" onclick="tmrToggleMobile()" title="Montre ou masque les chronos sur les téléphones des spectateurs (économise des lectures Firestore)">📱 Chrono sur mobiles : ${ST.timersMobile!==false?'visible':'masqué'}</button>` : ''}
     </div>`;
   }
   h += `<div class="tmr-grid ${per?'':'single'}">${shown.map(k=>tmrCardHTML(k,ctl,per)).join('')}</div>`;
@@ -4328,9 +4333,55 @@ function tmrSounds(){
   });
 }
 
+// ══════════════════════════════════════════════════════════
+// DOCUMENT DÉDIÉ AUX CHRONOS (foottournoi24/timers) + INTERRUPTEUR « CHRONO SUR MOBILES »
+// Séparé de 'status' pour que les spectateurs n'aient PAS à l'écouter quand
+// l'admin masque les chronos sur les mobiles : chaque commande de chrono ne
+// coûte alors des lectures qu'à la TV, à l'admin et aux scorers.
+// Si les règles Firestore refusent ce document, repli automatique sur
+// foottournoi24/status (comportement précédent, sans économie de lectures).
+// ══════════════════════════════════════════════════════════
+const TMR_COLL = 'foottournoi24';
+let unsubTimers = null, _tmrUseStatus = false, _tmrDocFailed = false;
+async function tmrPersist(next){
+  if(!_tmrUseStatus){
+    try { await setDoc(doc(db,TMR_COLL,'timers'), next); return; }
+    catch(e){
+      if(!String((e && e.code) || '').includes('permission')) throw e;
+      _tmrUseStatus = true; // règles : document 'timers' refusé → on garde l'ancien emplacement
+      console.warn('Document timers refusé par les règles Firestore, repli sur status', e);
+    }
+  }
+  await setDoc(doc(db,TMR_COLL,'status'), { timers: next }, { merge:true });
+}
+function tmrShouldListen(){
+  // connecté, pas détaché en arrière-plan, et : contrôleur, écran TV, ou chrono autorisé sur les mobiles
+  return !!USER_ROLE && !_bgDetached && (isScorer() || ST.page==='TV' || ST.timersMobile!==false);
+}
+function tmrSyncListener(){
+  if(!USER_ROLE){ _tmrDocFailed = false; _tmrUseStatus = false; }
+  const want = tmrShouldListen() && !_tmrDocFailed;
+  if(want && !unsubTimers){
+    unsubTimers = onSnapshot(doc(db,TMR_COLL,'timers'), (snap)=>{
+      if(snap.exists()) applyTimersObj(snap.data());
+    }, (e)=>{
+      console.warn('écoute des chronos', e);
+      unsubTimers = null; _tmrDocFailed = true; // les chronos arrivent alors via status (repli)
+    });
+  } else if(!want && unsubTimers){ unsubTimers(); unsubTimers = null; }
+}
+window.tmrToggleMobile = function(){
+  if(!isAdmin()) return;
+  const nv = (ST.timersMobile === false); // bascule
+  ST.timersMobile = nv;
+  setDoc(doc(db,TMR_COLL,'status'), { timersMobile: nv }, { merge:true })
+    .catch(e=>{ console.error('tmrToggleMobile', e); alert('Réglage non enregistré : '+e.message); });
+};
+
 let _tmrSigDone = '';
 function timerTick(){
-  const sig = [ST.timers.mode, ST.timers.tvSound?1:0, ST.cfg.courts||4, isScorer()?1:0, isAdmin()?1:0, tmrKeys().map(k=>k+':'+tmrCls(tmrGet(k))).join(',')].join('|');
+  tmrSyncListener();
+  const sig = [ST.timers.mode, ST.timers.tvSound?1:0, ST.timersMobile!==false?1:0, ST.cfg.courts||4, isScorer()?1:0, isAdmin()?1:0, tmrKeys().map(k=>k+':'+tmrCls(tmrGet(k))).join(',')].join('|');
   if(sig !== _tmrSigDone){ _tmrSigDone = sig; renderTimerPanel(); renderTVTimers(); }
   document.querySelectorAll('[data-tmr]').forEach(el=>{
     const t = tmrGet(el.dataset.tmr);
