@@ -91,6 +91,7 @@ const ST = {
   registrationsOpen:false, // ouverture/fermeture de l'inscription en ligne des équipes
   phase:'pools',   // 'pools' | 'bracket' | 'done'
   timerSec:0, timerRun:false, timerMode:'match', timerIv:null,
+  timers:{ v:0, mode:'single', all:null, courts:{} }, // chronos synchronisés (foottournoi24/status.timers)
   referees:[],     // liste des noms d'arbitres disponibles ["Jean D.", ...]
   // Programmation des arbitres par phase et par terrain : chaque arbitre
   // affecté à un terrain fait TOUS les matchs de ce terrain sur la phase
@@ -528,7 +529,7 @@ function startLiveWatch(){
     if(!snap.exists()) return;
     const d = snap.data();
     handleLiveOpenChange(d.liveOpen === true);
-    handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
+    handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
   }, (e)=>{ console.warn('startLiveWatch', e); });
 
   // Polling de secours toutes les 4 secondes : sur mobile, le navigateur peut
@@ -542,7 +543,7 @@ function startLiveWatch(){
         if(snap.exists()){
           const d = snap.data();
           handleLiveOpenChange(d.liveOpen === true);
-          handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
+          handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
         }
       } catch(e){ /* silencieux : réseau indisponible */ }
     }, 4000);
@@ -572,7 +573,7 @@ document.addEventListener('visibilitychange', async ()=>{
     if(snap.exists()){
       const d = snap.data();
       handleLiveOpenChange(d.liveOpen === true);
-      handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft);
+      handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
     }
   } catch(e){ console.warn('resync visibilitychange', e); }
 });
@@ -4107,38 +4108,213 @@ function fmt(s){ return String(Math.floor(s/60)).padStart(2,'0')+':'+String(s%60
 function currentMatchDuration(){
   return ST.activeView==='bracket' ? (ST.cfg.matchDurBracket||12) : (ST.cfg.matchDur||12);
 }
-function updateTimerDisplay(){
-  const el=document.getElementById('tmrDsp'); if(!el) return;
-  const s=ST.timerSec;
-  el.textContent=fmt(s);
-  el.className='timer-big '+(s===0?'tc-zero':ST.timerMode==='match'?'tc-match':'tc-trans');
-  const lblEl=document.getElementById('tmrLbl');
-  if(lblEl) lblEl.textContent=ST.timerMode==='match'?`⏱ MATCH — ${currentMatchDuration()} min`:`⏸ TRANSITION — ${ST.cfg.tt} min`;
-  if(ST.timerRun){ if(s===0) _playSiren(2.5,0.9); else if(s===30) _playWarn30(); else if(s>=1&&s<=5) _playCountdownBeep(s===1); }
+
+// ══════════════════════════════════════════════════════════
+// CHRONOS SYNCHRONISÉS — état partagé dans foottournoi24/status.timers
+// (document déjà lisible par tout le monde et déjà écouté en temps réel +
+// polling 4 s + resync au retour d'arrière-plan : aucune nouvelle règle
+// Firestore à ajouter). On ne stocke PAS « il reste N secondes » mais
+// l'instant de fin (timestamp) : chaque appareil recalcule lui-même le
+// temps restant → tous les écrans (TV, mobiles, ordis) affichent la même
+// valeur à la seconde près, sans écriture à chaque seconde.
+//   timers = { v, mode:'single'|'perCourt', all:T|null, courts:{ '1':T|null, … } }
+//   T      = { m:'match'|'trans', dur:secondes, st:'run'|'pause', end:ms, rem:secondes }
+// ══════════════════════════════════════════════════════════
+function tmrKeys(){
+  return ST.timers.mode==='perCourt'
+    ? Array.from({length:(ST.cfg.courts||4)}, (_,i)=>String(i+1))
+    : ['all'];
 }
-window.startTimer = function(mode){
-  if(!isAdmin()) return;
-  _unlockAudio(); clearInterval(ST.timerIv); ST.timerMode=mode;
-  const secs = mode==='match' ? currentMatchDuration() : (ST.cfg.tt||4);
-  ST.timerSec=secs*60; ST.timerRun=true; updateTimerDisplay();
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display=''; if(r) r.style.display='none';
-  ST.timerIv=setInterval(()=>{ if(ST.timerSec>0){ ST.timerSec--;updateTimerDisplay(); } else { clearInterval(ST.timerIv);ST.timerRun=false; const p2=document.getElementById('tmrP'); if(p2) p2.style.display='none'; } },1000);
-};
-window.pauseTimer = function(){
-  if(!isAdmin()) return;
-  clearInterval(ST.timerIv);ST.timerRun=false;
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display='none'; if(r) r.style.display='';
-};
-window.resumeTimer = function(){
-  if(!isAdmin()) return;
+function tmrGet(k){ return k==='all' ? ST.timers.all : (ST.timers.courts||{})[k] || null; }
+function tmrRemaining(t){
+  if(!t) return 0;
+  if(t.st==='run') return Math.max(0, Math.ceil((t.end-Date.now())/1000));
+  return Math.max(0, t.rem||0);
+}
+function tmrCls(t){ // none | run | pause | fin
+  if(!t) return 'none';
+  if(t.st==='pause') return 'pause';
+  return tmrRemaining(t)>0 ? 'run' : 'fin';
+}
+function tmrState(t){ // pour la couleur
+  if(!t) return 'idle';
+  if(t.st==='run' && tmrRemaining(t)===0) return 'zero';
+  return t.m==='trans' ? 'trans' : 'match';
+}
+function tmrLabel(t){
+  if(!t) return '';
+  const mins = Math.round((t.dur||0)/60);
+  return (t.m==='trans' ? `⏸ TRANSITION — ${mins} min` : `⏱ MATCH — ${mins} min`) + (t.st==='pause' ? ' · en pause' : '');
+}
+
+// Réception de l'état partagé (appelée à chaque lecture de foottournoi24/status)
+function applyTimersFromStatus(d){
+  const tm = d && d.timers;
+  if(!tm || typeof tm!=='object') return;
+  if((tm.v||0) < (ST.timers.v||0)) return; // lecture plus ancienne que notre état local : on ignore
+  ST.timers = {
+    v: tm.v||0,
+    mode: tm.mode==='perCourt' ? 'perCourt' : 'single',
+    tvSound: tm.tvSound===true,
+    all: tm.all || null,
+    courts: tm.courts || {}
+  };
+}
+
+// Commandes (admin + scorer)
+function tmrApply(t, action, mode, now){
+  if(action==='start'){
+    const secs = (mode==='match' ? currentMatchDuration() : (ST.cfg.tt||4)) * 60;
+    return { m:mode, dur:secs, st:'run', end:now+secs*1000, rem:secs };
+  }
+  if(action==='pause'){
+    if(!t || t.st!=='run') return t;
+    return { ...t, st:'pause', rem:Math.max(0, Math.ceil((t.end-now)/1000)) };
+  }
+  if(action==='resume'){
+    if(!t || t.st!=='pause') return t;
+    return { ...t, st:'run', end:now+(t.rem||0)*1000 };
+  }
+  if(action==='reset') return null;
+  return t;
+}
+async function tmrMutate(fn){
+  if(!isScorer()) return;
   _unlockAudio();
-  const p=document.getElementById('tmrP'), r=document.getElementById('tmrR');
-  if(p) p.style.display=''; if(r) r.style.display='none';
-  ST.timerRun=true;
-  ST.timerIv=setInterval(()=>{ if(ST.timerSec>0){ ST.timerSec--;updateTimerDisplay(); } else { clearInterval(ST.timerIv);ST.timerRun=false; const p2=document.getElementById('tmrP'); if(p2) p2.style.display='none'; } },1000);
+  const cur = ST.timers;
+  const next = JSON.parse(JSON.stringify(cur));
+  if(!next.courts) next.courts = {};
+  fn(next);
+  next.v = Math.max(Date.now(), (cur.v||0)+1);
+  ST.timers = next;          // effet immédiat sur cet appareil
+  timerTick();
+  try { await setDoc(doc(db,'foottournoi24','status'), { timers: next }, { merge:true }); }
+  catch(e){
+    console.error('tmrMutate', e);
+    alert('Chrono non synchronisé : '+e.message+(String(e.code||'').includes('permission') ? '\n\nLes règles Firestore refusent l\'écriture sur foottournoi24/status pour ce compte.' : ''));
+  }
+}
+window.tmrToggleTvSound = function(){
+  if(!isAdmin()) return;
+  tmrMutate(n=>{ n.tvSound = !n.tvSound; });
 };
+window.tmrSetMode = function(mode){
+  tmrMutate(n=>{ n.mode = (mode==='perCourt') ? 'perCourt' : 'single'; });
+};
+window.tmrCmd = function(key, action, mode){
+  tmrMutate(n=>{
+    const now = Date.now(); // même instant pour tous les terrains → départ simultané parfait
+    const keys = key==='*' ? (n.mode==='perCourt' ? Array.from({length:(ST.cfg.courts||4)}, (_,i)=>String(i+1)) : ['all']) : [key];
+    keys.forEach(k=>{
+      const curT = k==='all' ? n.all : n.courts[k];
+      const nx = tmrApply(curT, action, mode, now) || null;
+      if(k==='all') n.all = nx; else n.courts[k] = nx;
+    });
+  });
+};
+
+// Affichage — panneau de la page « Tournoi en direct » (tous les rôles)
+function tmrCardHTML(k, ctl, per){
+  const t = tmrGet(k), c = tmrCls(t);
+  const title = per ? 'Terrain '+k : 'Tous les terrains';
+  let btns = '';
+  if(ctl){
+    btns = `<div class="tmr-btns">
+      <button class="btn btn-g btn-xs" onclick="tmrCmd('${k}','start','match')">▶ Match</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrCmd('${k}','start','trans')">↔ Transition</button>
+      ${c==='run' ? `<button class="btn btn-ghost btn-xs" onclick="tmrCmd('${k}','pause')">⏸ Pause</button>` : ''}
+      ${c==='pause' ? `<button class="btn btn-ghost btn-xs" onclick="tmrCmd('${k}','resume')">▶ Reprendre</button>` : ''}
+      ${t ? `<button class="btn btn-ghost btn-xs" onclick="tmrCmd('${k}','reset')" title="Remettre à zéro">↺</button>` : ''}
+    </div>`;
+  }
+  return `<div class="tmr-card"><div class="timer-lbl">${title}</div>
+    <div class="timer-big" data-tmr="${k}" data-state="idle">00:00</div>
+    <div class="tmr-sub" data-tmr-lbl="${k}"></div>${btns}</div>`;
+}
+function renderTimerPanel(){
+  const el = document.getElementById('tmrPanel'); if(!el) return;
+  const ctl = isScorer(), per = ST.timers.mode==='perCourt';
+  const keys = tmrKeys();
+  const shown = ctl ? keys : keys.filter(k=>tmrGet(k)); // un spectateur ne voit que les chronos lancés
+  if(!shown.length){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display = '';
+  let h = '';
+  if(ctl){
+    h += `<div class="tmr-top">
+      <button class="btn btn-sm ${!per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('single')">⏱ 1 chrono pour tous les terrains</button>
+      <button class="btn btn-sm ${per?'btn-g':'btn-ghost'}" onclick="tmrSetMode('perCourt')">🏟️ 1 chrono par terrain</button>
+      <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son sur cet appareil">${_soundEnabled?'🔊':'🔇'}</button>
+      ${isAdmin() ? `<button class="btn ${ST.timers.tvSound?'btn-g':'btn-ghost'} btn-sm" onclick="tmrToggleTvSound()" title="Active ou coupe la sirène sur l'écran TV">📺 Son TV : ${ST.timers.tvSound?'activé':'coupé'}</button>` : ''}
+    </div>`;
+  }
+  h += `<div class="tmr-grid ${per?'':'single'}">${shown.map(k=>tmrCardHTML(k,ctl,per)).join('')}</div>`;
+  if(ctl && per){
+    h += `<div class="tmr-group"><span class="timer-lbl" style="margin:0">Tous les terrains en même temps</span>
+      <button class="btn btn-g btn-xs" onclick="tmrCmd('*','start','match')">▶ Match</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrCmd('*','start','trans')">↔ Transition</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrCmd('*','pause')">⏸ Pause</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrCmd('*','resume')">▶ Reprendre</button>
+      <button class="btn btn-ghost btn-xs" onclick="tmrCmd('*','reset')" title="Remettre tous les chronos à zéro">↺</button>
+    </div>`;
+  }
+  el.innerHTML = h;
+}
+// Affichage — bandeau de l'écran TV
+function renderTVTimers(){
+  const el = document.getElementById('tvTimerBar'); if(!el) return;
+  const per = ST.timers.mode==='perCourt';
+  const keys = tmrKeys().filter(k=>tmrGet(k));
+  if(!keys.length){ el.style.display='none'; el.innerHTML=''; return; }
+  el.style.display = 'flex';
+  el.innerHTML = keys.map(k=>`<div class="tv-tmr ${per?'':'big'}">
+    <div class="tv-tmr-l">${per?'Terrain '+k:'⏱ Chrono'}</div>
+    <div class="tv-tmr-v" data-tmr="${k}" data-state="idle">00:00</div>
+    <div class="tv-tmr-s" data-tmr-lbl="${k}"></div></div>`).join('');
+}
+
+// Sons (appareils admin/scorer uniquement) : on ne joue que sur un vrai
+// passage de seconde observé en direct (jamais en rejoignant un chrono déjà fini).
+const _tmrLast = {};
+function tmrSounds(){
+  // Sur la page Écran (TV) : le son suit le réglage de l'admin (Son TV).
+  // Ailleurs : appareils admin/scorer, selon leur bouton 🔊/🔇 local.
+  const allowed = (ST.page==='TV') ? (ST.timers.tvSound===true) : (isScorer() && _soundEnabled);
+  if(!allowed){ for(const k in _tmrLast) delete _tmrLast[k]; return; }
+  tmrKeys().forEach(k=>{
+    const t = tmrGet(k);
+    if(!t || t.st!=='run'){ delete _tmrLast[k]; return; }
+    const s = tmrRemaining(t), last = _tmrLast[k];
+    _tmrLast[k] = { end:t.end, s };
+    if(!last || last.end!==t.end || s>=last.s) return;
+    if(s===0) _playSiren(2.5,0.9);
+    else if(s===30) _playWarn30();
+    else if(s>=1 && s<=5) _playCountdownBeep(s===1);
+  });
+}
+
+let _tmrSigDone = '';
+function timerTick(){
+  const sig = [ST.timers.mode, ST.timers.tvSound?1:0, ST.cfg.courts||4, isScorer()?1:0, isAdmin()?1:0, tmrKeys().map(k=>k+':'+tmrCls(tmrGet(k))).join(',')].join('|');
+  if(sig !== _tmrSigDone){ _tmrSigDone = sig; renderTimerPanel(); renderTVTimers(); }
+  document.querySelectorAll('[data-tmr]').forEach(el=>{
+    const t = tmrGet(el.dataset.tmr);
+    const txt = fmt(tmrRemaining(t)); if(el.textContent!==txt) el.textContent = txt;
+    const st = tmrState(t); if(el.dataset.state!==st) el.dataset.state = st;
+  });
+  document.querySelectorAll('[data-tmr-lbl]').forEach(el=>{
+    const txt = tmrLabel(tmrGet(el.dataset.tmrLbl)); if(el.textContent!==txt) el.textContent = txt;
+  });
+  tmrSounds();
+  const sb = document.getElementById('tvSndBtn');
+  if(sb){
+    const need = ST.page==='TV' && ST.timers.tvSound===true && !(_AC && _AC.state==='running');
+    const disp = need ? '' : 'none'; if(sb.style.display!==disp) sb.style.display = disp;
+  }
+}
+// Les navigateurs exigent un geste pour autoriser le son : un seul toucher sur l'écran TV suffit.
+window.tvUnlockSound = function(){ _unlockAudio(); _playTone(880,0.15,'sine',0.005,0.6); timerTick(); };
+document.addEventListener('pointerdown', ()=>{ if(ST.page==='TV' && ST.timers.tvSound===true) _unlockAudio(); }, true);
+setInterval(timerTick, 250);
 
 // ── AUDIO (Web Audio API — sirène fin de match, alertes) ────
 let _AC=null, _soundEnabled=true;
@@ -4293,6 +4469,35 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 .timer-big.tc-trans{ color:#b8720a; }
 .timer-big.tc-zero{ color:#b02018;animation:blink 1s ease-in-out infinite; }
 .timer-btns{ display:flex;flex-direction:column;gap:7px;align-items:flex-end; }
+
+/* ── CHRONOS SYNCHRONISÉS ───────────────────────────── */
+.tmr-panel{ background:var(--s2);border-radius:var(--r);padding:14px 18px;margin-bottom:18px;box-shadow:var(--shadow2); }
+.tmr-top{ display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:12px; }
+.tmr-grid{ display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px; }
+.tmr-grid.single{ grid-template-columns:1fr; }
+.tmr-card{ background:#fff;border:1px solid var(--bdr);border-radius:12px;padding:12px 14px;text-align:center; }
+.tmr-card .timer-big{ font-size:44px; }
+.tmr-grid.single .timer-big{ font-size:64px; }
+.tmr-sub{ font-size:11px;color:var(--muted);min-height:15px;margin:2px 0 6px; }
+.tmr-btns{ display:flex;gap:6px;flex-wrap:wrap;justify-content:center; }
+.tmr-group{ display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-top:12px;padding-top:12px;border-top:1px solid var(--bdr); }
+.timer-big[data-state="match"]{ color:#1a7a3a; }
+.timer-big[data-state="trans"]{ color:#b8720a; }
+.timer-big[data-state="zero"]{ color:#b02018;animation:blink 1s ease-in-out infinite; }
+.timer-big[data-state="idle"]{ color:var(--muted); }
+
+.tv-snd{ margin-left:auto;background:#ffd27a;color:#3a2a00;border:0;border-radius:30px;padding:8px 18px;font-family:'Oswald',sans-serif;font-size:clamp(12px,1.4vw,18px);cursor:pointer;animation:blink 1.4s ease-in-out infinite; }
+.tv-snd + .tv-clock{ margin-left:0; }
+.tv-tmr-bar{ display:flex;flex-wrap:wrap;justify-content:center;gap:clamp(8px,1.4vw,18px);padding:clamp(6px,1.2vh,14px) clamp(16px,4vw,60px);flex-shrink:0;border-bottom:1px solid rgba(255,255,255,.1); }
+.tv-tmr{ background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.2);border-radius:14px;padding:6px clamp(14px,2vw,28px);text-align:center;min-width:clamp(120px,14vw,200px); }
+.tv-tmr-l{ font-family:'Oswald',sans-serif;font-size:clamp(11px,1.2vw,16px);letter-spacing:1.5px;color:rgba(255,255,255,.6);text-transform:uppercase; }
+.tv-tmr-v{ font-family:'Oswald',sans-serif;font-weight:700;font-size:clamp(30px,5vw,68px);line-height:1.05;font-variant-numeric:tabular-nums; }
+.tv-tmr.big .tv-tmr-v{ font-size:clamp(52px,9vw,128px); }
+.tv-tmr-s{ font-size:clamp(10px,1vw,14px);color:rgba(255,255,255,.55);min-height:1em; }
+.tv-tmr-v[data-state="match"]{ color:#7affa0; }
+.tv-tmr-v[data-state="trans"]{ color:#ffd27a; }
+.tv-tmr-v[data-state="zero"]{ color:#ff6b5e;animation:blink 1s ease-in-out infinite; }
+.tv-tmr-v[data-state="idle"]{ color:rgba(255,255,255,.4); }
 
 /* ── STANDINGS ───────────────────────────────────────── */
 .stbl{ width:100%;border-collapse:collapse;font-size:13px; }
@@ -4875,24 +5080,8 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 <div class="wrap">
   <div class="sec-ttl">⚽ Tournoi en direct</div>
 
-  <!-- CHRONO MATCH -->
-  <div class="timer-wrap" data-role="admin">
-    <div>
-      <div class="timer-lbl" id="tmrLbl">⏱ MATCH</div>
-      <div class="timer-big tc-match" id="tmrDsp">00:00</div>
-    </div>
-    <div class="timer-btns">
-      <div style="display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end">
-        <button class="btn btn-g btn-sm" onclick="startTimer('match')">▶ Match</button>
-        <button class="btn btn-ghost btn-sm" onclick="startTimer('trans')">⏸ Transition</button>
-        <button class="btn btn-ghost btn-xs" id="soundToggle" onclick="toggleSound()" title="Activer/couper le son">🔊</button>
-      </div>
-      <div style="display:flex;gap:6px">
-        <button class="btn btn-ghost btn-xs" id="tmrP" onclick="pauseTimer()" style="display:none">⏸</button>
-        <button class="btn btn-ghost btn-xs" id="tmrR" onclick="resumeTimer()" style="display:none">▶ Reprendre</button>
-      </div>
-    </div>
-  </div>
+  <!-- CHRONOS (synchronisés : admin/scorer commandent, tout le monde voit) -->
+  <div id="tmrPanel" class="tmr-panel" style="display:none"></div>
 
   <!-- Onglets vue Poules/Finale -->
   <div class="rtabs" id="viewTabs"></div>
@@ -5053,8 +5242,10 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
   <div class="tv-hdr">
     <div class="tv-brand">⚽ Tournoi Vétérans UST</div>
     <div class="tv-phase-badge" id="tvPhaseBadge">—</div>
+    <button class="tv-snd" id="tvSndBtn" style="display:none" onclick="tvUnlockSound()">🔇 Toucher pour activer le son</button>
     <div class="tv-clock" id="tvClock">--:--:--</div>
   </div>
+  <div class="tv-tmr-bar" id="tvTimerBar" style="display:none"></div>
   <div class="tv-sub-ttl" id="tvSubTitle">⚽ Résultats en direct</div>
   <div class="tv-body" id="tvContent"></div>
 
