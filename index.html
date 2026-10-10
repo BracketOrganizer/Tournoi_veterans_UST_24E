@@ -521,6 +521,7 @@ function handleLiveOpenChange(nowOpen){
 
 let unsubLiveWatch = null;
 let liveWatchIv = null; // polling de secours (mobile en veille)
+let _bgDetached = false, _bgDetachTO = null, _bgWas = null; // détachement des spectateurs en arrière-plan
 
 function startLiveWatch(){
   if(unsubLiveWatch) return; // déjà actif
@@ -532,12 +533,13 @@ function startLiveWatch(){
     handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
   }, (e)=>{ console.warn('startLiveWatch', e); });
 
-  // Polling de secours toutes les 4 secondes : sur mobile, le navigateur peut
+  // Polling de secours toutes les 30 secondes, écran visible seulement : sur mobile, le navigateur peut
   // suspendre le WebSocket Firestore sans déclencher visibilitychange. Le
   // polling garantit que la fermeture/ouverture du live est détectée même dans
   // ce cas, sans attendre que l'utilisateur touche l'écran.
   if(!liveWatchIv){
     liveWatchIv = setInterval(async ()=>{
+      if(document.visibilityState !== 'visible' || _bgDetached) return; // inutile (et coûteux) écran éteint
       try {
         const snap = await getDoc(doc(db,'foottournoi24','status'));
         if(snap.exists()){
@@ -546,7 +548,7 @@ function startLiveWatch(){
           handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
         }
       } catch(e){ /* silencieux : réseau indisponible */ }
-    }, 4000);
+    }, 30000);
   }
 }
 
@@ -566,6 +568,7 @@ startLiveWatch();
 // ══════════════════════════════════════════════════════════
 document.addEventListener('visibilitychange', async ()=>{
   if(document.visibilityState !== 'visible') return;
+  if(_bgDetached) return; // la réécoute (bloc ci-dessous) recharge déjà l'état
   // On lit foottournoi/status (toujours lisible) pour détecter liveOpen,
   // même si current est illisible pour un spectateur quand liveOpen=false.
   try {
@@ -576,6 +579,38 @@ document.addEventListener('visibilitychange', async ()=>{
       handleRegStatusChange(d.registrationsOpen === true, d.slotsLeft); applyTimersFromStatus(d);
     }
   } catch(e){ console.warn('resync visibilitychange', e); }
+});
+
+// ══════════════════════════════════════════════════════════
+// ÉCONOMIE DE LECTURES FIRESTORE (plan Spark : 50 000 lectures / jour)
+// Un spectateur dont l'écran est éteint ou l'appli en arrière-plan reste
+// abonné : il « consomme » une lecture à chaque score et chaque commande de
+// chrono sans rien regarder. Après 10 min en arrière-plan, on coupe l'écoute ;
+// au retour, on se réabonne (1 lecture initiale = état à jour).
+// Ne concerne ni admin / scorer / manager (ils écrivent), ni l'écran TV.
+// ══════════════════════════════════════════════════════════
+const BG_DETACH_MS = 10*60*1000;
+function _bgCanDetach(){ return USER_ROLE==='spectator' && ST.page!=='TV'; }
+document.addEventListener('visibilitychange', ()=>{
+  if(document.visibilityState==='hidden'){
+    clearTimeout(_bgDetachTO);
+    _bgDetachTO = setTimeout(()=>{
+      if(document.visibilityState!=='hidden' || _bgDetached || !_bgCanDetach()) return;
+      _bgWas = { t:!!unsubTournament, m:!!unsubMessages };
+      if(unsubTournament){ unsubTournament(); unsubTournament=null; }
+      if(unsubMessages){ unsubMessages(); unsubMessages=null; }
+      stopLiveWatch();
+      _bgDetached = true;
+    }, BG_DETACH_MS);
+  } else {
+    clearTimeout(_bgDetachTO);
+    if(_bgDetached){
+      _bgDetached = false;
+      if(_bgWas && _bgWas.t) subscribeToTournament(); else startLiveWatch();
+      if(_bgWas && _bgWas.m) subscribeToMessages();
+      _bgWas = null;
+    }
+  }
 });
 
 // ══════════════════════════════════════════════════════════
