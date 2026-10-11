@@ -4344,19 +4344,25 @@ function tmrSounds(){
 const TMR_COLL = 'foottournoi24';
 let unsubTimers = null, _tmrUseStatus = false, _tmrDocFailed = false;
 async function tmrPersist(next){
-  if(!_tmrUseStatus){
-    try { await setDoc(doc(db,TMR_COLL,'timers'), next); return; }
-    catch(e){
-      if(!String((e && e.code) || '').includes('permission')) throw e;
-      _tmrUseStatus = true; // règles : document 'timers' refusé → on garde l'ancien emplacement
-      console.warn('Document timers refusé par les règles Firestore, repli sur status', e);
-    }
+  // Mode « visible sur les mobiles » (par défaut) : les chronos voyagent par foottournoi24/status, déjà écouté
+  // par tout le monde → aucune règle Firestore supplémentaire nécessaire.
+  // Mode « masqué » : document dédié 'timers', écouté seulement par la TV, l'admin et les scorers.
+  if(ST.timersMobile !== false || _tmrUseStatus){
+    await setDoc(doc(db,TMR_COLL,'status'), { timers: next }, { merge:true });
+    return;
+  }
+  try { await setDoc(doc(db,TMR_COLL,'timers'), next); return; }
+  catch(e){
+    if(!String((e && e.code) || '').includes('permission')) throw e;
+    _tmrUseStatus = true; // règles : document 'timers' refusé → on garde l'emplacement status
+    console.warn('Document timers refusé par les règles Firestore, repli sur status', e);
   }
   await setDoc(doc(db,TMR_COLL,'status'), { timers: next }, { merge:true });
 }
 function tmrShouldListen(){
-  // connecté, pas détaché en arrière-plan, et : contrôleur, écran TV, ou chrono autorisé sur les mobiles
-  return !!USER_ROLE && !_bgDetached && (isScorer() || ST.page==='TV' || ST.timersMobile!==false);
+  // Le document 'timers' n'est écouté qu'en mode « masqué », par la TV et les contrôleurs.
+  // En mode « visible », tout passe par status (déjà écouté par tous).
+  return !!USER_ROLE && !_bgDetached && ST.timersMobile === false && (isScorer() || ST.page==='TV');
 }
 function tmrSyncListener(){
   if(!USER_ROLE){ _tmrDocFailed = false; _tmrUseStatus = false; }
@@ -4372,10 +4378,21 @@ function tmrSyncListener(){
 }
 window.tmrToggleMobile = function(){
   if(!isAdmin()) return;
-  const nv = (ST.timersMobile === false); // bascule
+  const nv = (ST.timersMobile === false); // bascule : true = visible sur les mobiles
   ST.timersMobile = nv;
-  setDoc(doc(db,TMR_COLL,'status'), { timersMobile: nv }, { merge:true })
-    .catch(e=>{ console.error('tmrToggleMobile', e); alert('Réglage non enregistré : '+e.message); });
+  const ops = [];
+  if(nv){
+    // retour en « visible » : l'état courant des chronos est republié dans status pour les spectateurs
+    ops.push(setDoc(doc(db,TMR_COLL,'status'), { timersMobile:true, timers: ST.timers }, { merge:true }));
+  } else {
+    ops.push(setDoc(doc(db,TMR_COLL,'status'), { timersMobile:false }, { merge:true }));
+    // passage en « masqué » : le document dédié reçoit l'état courant (pour la TV)
+    if(!_tmrUseStatus) ops.push(setDoc(doc(db,TMR_COLL,'timers'), ST.timers).catch(e=>{
+      if(String((e && e.code) || '').includes('permission')){ _tmrUseStatus = true; console.warn('Document timers refusé, repli sur status', e); }
+      else throw e;
+    }));
+  }
+  Promise.all(ops).catch(e=>{ console.error('tmrToggleMobile', e); alert('Réglage non enregistré : '+e.message); });
 };
 
 let _tmrSigDone = '';
