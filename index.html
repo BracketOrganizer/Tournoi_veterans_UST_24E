@@ -3785,7 +3785,7 @@ function tvMatchRowHTML(m, isLive){
 // Grille de cartes de match. isLiveFn(m) détermine si CE match doit être mis
 // en avant comme "en cours" (uniquement pertinent s'il n'est pas encore joué).
 function tvMatchGridHTML(matches, isLiveFn){
-  if(!matches.length) return `<div class="tv-empty">Aucun match à afficher pour le moment.</div>`;
+  if(!matches.length) return `<div class="tv-empty">Aucun match en cours ou à venir.</div>`;
   const cards = matches.map(m=>tvMatchRowHTML(m, !m.done && isLiveFn && isLiveFn(m))).join('');
   return `<div class="tv-match-grid">${cards}</div>`;
 }
@@ -3798,6 +3798,28 @@ const TV_PAGE_SIZE = 12; // nombre maximum de matchs affichés sur un même écr
 // matchs de la finale sont séparés tour par tour (Tour 1 / Tour 2 / Tour
 // Classement), suivis du classement final. Chaque écran affiche au plus
 // TV_PAGE_SIZE matchs (au-delà, pagination automatique).
+const TV_MAX_MATCHES = 12; // écran TV : nombre maximum de matchs affichés (créneau en cours + créneaux suivants, coupés à la fin d'un créneau)
+// Ne garde que les matchs EN COURS et À VENIR (les matchs déjà joués disparaissent
+// de l'écran TV). Un match terminé reste visible tant que son créneau est encore
+// en cours (ou que le créneau d'un match non terminé est le même/postérieur), pour
+// qu'on puisse voir le score final avant le passage au créneau suivant.
+// Retourne { shown:[...], hidden:N } où hidden = nb de matchs à venir non affichés (limite).
+function tvKeepLiveAndUpcoming(list, isLiveFn){
+  const pending = list.filter(m=>!m.done);
+  if(!pending.length) return { shown:[], hidden:0 };
+  const minSlot = Math.min(...pending.map(m=>m.slot));
+  const kept = list.filter(m=>!m.done || m.slot>=minSlot || (isLiveFn && isLiveFn(m)));
+  const slots = [...new Set(kept.map(m=>m.slot))].sort((a,b)=>a-b);
+  const shown = [];
+  for(const sl of slots){
+    const grp = kept.filter(m=>m.slot===sl);
+    if(shown.length && shown.length+grp.length > TV_MAX_MATCHES) break;
+    shown.push(...grp);
+  }
+  const hidden = pending.length - shown.filter(m=>!m.done).length;
+  return { shown, hidden };
+}
+function tvMoreHTML(n){ return n>0 ? `<div class="tv-more">+ ${n} autre${n>1?'s':''} match${n>1?'s':''} à venir</div>` : ''; }
 function getTVScreens(){
   const screens = [];
   if(ST.phase==='pools'){
@@ -3808,9 +3830,11 @@ function getTVScreens(){
     const poolMatches = tvAllMatchesFlat().filter(m=>m.type==='pool').sort((a,b)=>a.slot-b.slot||a.court-b.court);
     const isLiveNow = (ST.activeView==='pools' && typeof ST.activePoolRound==='number')
       ? (m=>m.slot===ST.activePoolRound) : (()=>false);
+    const poolKeep = tvKeepLiveAndUpcoming(poolMatches, isLiveNow);
     screens.push({
-      key:'pool-results', kind:'matches', title:'⚽ Matchs de Poules',
-      render: ()=>tvMatchGridHTML(poolMatches, isLiveNow)
+      key:'pool-results', kind:'matches', title:'⚽ Matchs en cours et à venir',
+      empty: poolKeep.shown.length===0,
+      render: ()=>tvMatchGridHTML(poolKeep.shown, isLiveNow) + tvMoreHTML(poolKeep.hidden)
     });
     screens.push({ key:'pool-std', kind:'standings', title:'📊 Classement des Poules', render: tvStandingsPoolsHTML });
   } else {
@@ -3825,15 +3849,20 @@ function getTVScreens(){
         return { slot:b.slot, court:b.court, time:b.time, label:b.label||bracketLabel(b.m),
           aId:bracketTeam(b.m,'a'), bId:bracketTeam(b.m,'b'), r, done:(r.ga!==''&&r.gb!=='') };
       });
-      const isLiveNow = ()=> ST.activeView==='bracket' && ST.activeBracketRound===round;
+      // « En cours » = les matchs du créneau en cours (le plus ancien créneau non terminé) du tour actif.
+      const pendSlots = flat.filter(m=>!m.done).map(m=>m.slot);
+      const curSlot = pendSlots.length ? Math.min(...pendSlots) : null;
+      const isLiveNow = (m)=> ST.activeView==='bracket' && ST.activeBracketRound===round && m.slot===curSlot;
+      const keep = tvKeepLiveAndUpcoming(flat, null);
       // Pagination de sécurité si jamais un tour dépassait 12 matchs (cas inhabituel).
-      const pageCount = Math.max(1, Math.ceil(flat.length/TV_PAGE_SIZE));
+      const pageCount = Math.max(1, Math.ceil(keep.shown.length/TV_PAGE_SIZE));
       for(let i=0;i<pageCount;i++){
-        const page = flat.slice(i*TV_PAGE_SIZE,(i+1)*TV_PAGE_SIZE);
+        const page = keep.shown.slice(i*TV_PAGE_SIZE,(i+1)*TV_PAGE_SIZE);
         screens.push({
           key:'bracket-r'+round+'-'+i, kind:'matches',
           title: pageCount>1 ? `${roundTitle[round]} (${i+1}/${pageCount})` : roundTitle[round],
-          render: ()=>tvMatchGridHTML(page, isLiveNow)
+          empty: keep.shown.length===0,
+          render: ()=>tvMatchGridHTML(page, isLiveNow) + (i===pageCount-1 ? tvMoreHTML(keep.hidden) : '')
         });
       }
     });
@@ -3855,6 +3884,11 @@ function tvIsBracketRoundDone(round){
 // résultats, puis Tour 2, puis on alterne Tour Classement et Classement
 // Final une fois les deux premiers tours bouclés.
 function getActiveTVScreens(){
+  const all = _tvActiveScreensRaw();
+  const nonEmpty = all.filter(s=>!s.empty);
+  return nonEmpty.length ? nonEmpty : all;
+}
+function _tvActiveScreensRaw(){
   const screens = getTVScreens();
   const cfg = getTVSettings();
   if(cfg.mode==='standings') return screens.filter(s=>s.kind==='standings');
@@ -4720,7 +4754,8 @@ input[type=checkbox]{ width:auto;margin-right:6px; }
 .tv-tmr{ background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.2);border-radius:14px;padding:6px clamp(14px,2vw,28px);text-align:center;min-width:clamp(120px,14vw,200px); }
 .tv-tmr-l{ font-family:'Oswald',sans-serif;font-size:clamp(11px,1.2vw,16px);letter-spacing:1.5px;color:rgba(255,255,255,.6);text-transform:uppercase; }
 .tv-tmr-v{ font-family:'Oswald',sans-serif;font-weight:700;font-size:clamp(30px,5vw,68px);line-height:1.05;font-variant-numeric:tabular-nums; }
-.tv-tmr.big .tv-tmr-v{ font-size:clamp(52px,9vw,128px); }
+.tv-tmr.big{ padding:2px clamp(14px,2vw,28px); }
+.tv-tmr.big .tv-tmr-v{ font-size:clamp(38px,6.2vw,88px); }
 .tv-tmr-s{ font-size:clamp(10px,1vw,14px);color:rgba(255,255,255,.55);min-height:1em; }
 .tv-tmr-v[data-state="match"]{ color:#7affa0; }
 .tv-tmr-v[data-state="trans"]{ color:#ffd27a; }
@@ -4775,7 +4810,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 .tv-live-ttl{ color:#ff6b5e; display:flex; align-items:center; gap:10px; }
 .tv-live-dot{ width:14px; height:14px; border-radius:50%; background:#ff3b30; display:inline-block; animation:blink 1s ease-in-out infinite; }
 
-.tv-match-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(340px,1fr)); gap:12px; margin-bottom:8px; }
+.tv-match-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(340px,100%),1fr)); gap:12px; margin-bottom:8px; }
 .tv-match-row{ background:rgba(255,255,255,.06); border:1px solid rgba(255,255,255,.14); border-radius:14px; padding:14px 18px; }
 .tv-match-row.tv-match-live{ border-color:#ff6b5e; background:rgba(255,80,60,.12); box-shadow:0 0 0 1px rgba(255,80,60,.4); }
 .tv-match-meta{ font-size:clamp(11px,1.1vw,14px); color:rgba(255,255,255,.6); margin-bottom:6px; display:flex; justify-content:space-between; gap:8px; }
@@ -4785,9 +4820,10 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 .tv-team-r{ text-align:right; }
 .tv-score{ font-family:'Oswald',sans-serif; font-weight:700; font-size:clamp(18px,2.4vw,30px); color:#ffd27a; white-space:nowrap; padding:0 6px; }
 
+.tv-more{ text-align:center; color:rgba(255,255,255,.55); font-family:'Oswald',sans-serif; font-size:clamp(13px,1.4vw,18px); letter-spacing:.8px; padding:8px 0 4px; }
 .tv-empty{ text-align:center; color:rgba(255,255,255,.5); padding:30px; font-size:clamp(14px,1.6vw,18px); }
 
-.tv-pools-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(360px,1fr)); gap:16px; }
+.tv-pools-grid{ display:grid; grid-template-columns:repeat(auto-fit,minmax(min(360px,100%),1fr)); gap:16px; }
 .tv-pool-card{ background:rgba(255,255,255,.05); border:2px solid; border-radius:14px; overflow:hidden; }
 .tv-pool-ttl{ font-family:'Oswald',sans-serif; font-weight:700; font-size:clamp(15px,1.6vw,20px); padding:8px 14px; }
 .tv-stbl{ width:100%; border-collapse:collapse; font-size:clamp(12px,1.3vw,17px); }
@@ -4822,6 +4858,45 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
 .msg-card-ttl{ font-family:'Oswald',sans-serif; font-weight:700; font-size:13px; margin-bottom:8px; }
 .msg-item{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; padding:8px; border:1px solid var(--bdr); border-radius:8px; background:var(--s0); }
 @keyframes blink{ 0%,100%{opacity:1}50%{opacity:.4} }
+
+/* ── ADAPTATION MOBILE (≤ 767px) — ne change rien sur ordinateur / TV ───── */
+@media(max-width:767px){
+  .wrap{ padding:14px 10px 80px; }
+  .sec-ttl{ font-size:20px; margin-bottom:12px; }
+  .card{ padding:12px; }
+  .card-ttl{ font-size:15px; flex-wrap:wrap; gap:6px; }
+  .hdr{ padding:0 10px; gap:8px; }
+  .hdr-brand{ font-size:15px; overflow:hidden; text-overflow:ellipsis; max-width:62vw; }
+  .btn{ padding:9px 14px; font-size:14px; }
+  .btn-sm{ padding:7px 11px; font-size:12.5px; }
+  .rtabs{ gap:5px; }
+  .rtab{ padding:5px 10px; font-size:13px; }
+  .stbl{ font-size:12px; }
+  .stbl th{ padding:7px 3px; font-size:9px; letter-spacing:.3px; }
+  .stbl td{ padding:7px 3px; }
+  .info{ padding:10px 12px; font-size:12.5px; line-height:1.6; }
+  .tmr-panel{ padding:10px 12px; }
+  .tmr-grid{ grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:8px; }
+  .tmr-card{ padding:8px 10px; }
+  .tmr-card .timer-big{ font-size:34px; }
+  .tmr-grid.single .timer-big, .timer-big{ font-size:52px; }
+  .timer-wrap{ padding:12px 14px; }
+  .spec-nav{ padding:0 6px; -webkit-overflow-scrolling:touch; }
+  .msg-modal-box{ padding:14px; max-height:92vh; }
+  /* Écran TV ouvert depuis un téléphone */
+  .tv-hdr{ gap:8px; padding:8px 12px; }
+  .tv-brand{ font-size:16px; }
+  .tv-body{ padding:0 10px 120px; }
+  .tv-match-row{ padding:10px 12px; }
+  .tv-tmr.big .tv-tmr-v{ font-size:clamp(36px,16vw,64px); }
+  .tv-bar{ gap:8px; padding:8px 10px calc(8px + env(safe-area-inset-bottom)); }
+  .tv-bar label{ font-size:11px; }
+}
+@media(max-width:380px){
+  .hdr-brand{ font-size:14px; }
+  .stbl{ font-size:11.5px; }
+  .tmr-card .timer-big{ font-size:30px; }
+}
 
 @media print{
   body{ background:#fff!important;color:#000!important;font-size:11px; }
