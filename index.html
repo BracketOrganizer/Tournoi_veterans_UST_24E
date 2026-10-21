@@ -297,7 +297,9 @@ function bracketLabel(m){
 // un compte Google admin légitime (autorisé à écrire côté Firestore) se
 // retrouvait quand même affiché en spectateur côté client si son document
 // users/{uid} n'avait pas explicitement role:'admin'.
-const HARDCODED_ADMIN_EMAILS = ['checheux@gmail.com', 'bracket.organizer@gmail.com'];
+// Seul admin « permanent » : toujours admin, quoi qu'il y ait dans sa fiche (filet de sécurité pour ne jamais perdre l'accès).
+// Tous les autres comptes (dont checheux@gmail.com) suivent le rôle attribué dans « Gérer le staff ».
+const HARDCODED_ADMIN_EMAILS = ['bracket.organizer@gmail.com'];
 
 // Rôle tel qu'écrit dans la fiche users/{uid} au moment de la connexion. On surveille ensuite cette
 // fiche : si un admin change le rôle de la personne, ses droits sont mis à jour immédiatement
