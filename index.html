@@ -299,7 +299,29 @@ function bracketLabel(m){
 // users/{uid} n'avait pas explicitement role:'admin'.
 const HARDCODED_ADMIN_EMAILS = ['checheux@gmail.com', 'bracket.organizer@gmail.com'];
 
+// Rôle tel qu'écrit dans la fiche users/{uid} au moment de la connexion. On surveille ensuite cette
+// fiche : si un admin change le rôle de la personne, ses droits sont mis à jour immédiatement
+// (rechargement de la page) au lieu de rester ceux de sa connexion précédente.
+let RAW_DOC_ROLE = null;
+let unsubRoleWatch = null;
+function stopRoleWatch(){ if(unsubRoleWatch){ try{ unsubRoleWatch(); }catch(e){} unsubRoleWatch = null; } }
+function watchOwnRole(uid, rawRole){
+  stopRoleWatch();
+  if(!['admin','users','scorer','manager'].includes(rawRole)) return; // pas de surveillance pour les simples spectateurs (économie de lectures)
+  try {
+    unsubRoleWatch = onSnapshot(doc(db,'users',uid), snap=>{
+      if(!snap.exists()) return;
+      const r = snap.data().role;
+      if(r !== rawRole){
+        stopRoleWatch();
+        alert('Vos droits ont été modifiés par un administrateur. La page va se recharger.');
+        location.reload();
+      }
+    }, ()=>{});
+  } catch(e){ console.warn('watchOwnRole', e); }
+}
 async function getUserProfile(uid, email){
+  RAW_DOC_ROLE = null;
   if(email && HARDCODED_ADMIN_EMAILS.includes(email)){
     return { role:'admin', teamId:null };
   }
@@ -320,6 +342,7 @@ async function getUserProfile(uid, email){
       if(d.role==='registrant' && d.tournament!=='foot24'){
         return { role:'spectator', teamId:null };
       }
+      RAW_DOC_ROLE = d.role || null;
       return { role: d.role || 'spectator', teamId: d.teamId || null,
         regStatus: d.regStatus || null, teamName: d.teamName || null,
         extraTeamIds: Array.isArray(d.extraTeamIds) ? d.extraTeamIds : [],
@@ -381,9 +404,11 @@ onAuthStateChanged(auth, async (user)=>{
     showApp();
     subscribeToTournament();
     subscribeToMessages();
+    watchOwnRole(CURRENT_USER.uid, RAW_DOC_ROLE);
     if(USER_ROLE === 'manager' && MANAGER_TEAM_ID) subscribeToRoster(MANAGER_TEAM_ID);
   } else {
     CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null; MANAGER_EXTRA_TEAM_IDS = []; MANAGER_VIEW_TEAM_ID = null; MANAGER_PENDING_REQUEST = null;
+    stopRoleWatch();
     unsubAll(); // relance startLiveWatch() : ST.liveOpen reste à jour en continu
     showLogin();
   }
@@ -2068,13 +2093,13 @@ function renderUsersList(users){
         <div style="font-size:11px;color:var(--muted)">${u.email||'—'}${u.role==='manager'&&u.teamId?' · '+tName(u.teamId):''}</div>
       </div>
       <span style="font-size:11px;font-weight:700;color:${roleColor(u.role)};text-transform:uppercase;letter-spacing:.5px;min-width:90px">${u.role||'spectator'}</span>
-      <select onchange="changeUserRole('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer le rôle de ${u.email||u.id}">
+      ${(typeof HARDCODED_ADMIN_EMAILS!=='undefined' && HARDCODED_ADMIN_EMAILS.includes(u.email)) ? `<span style="font-size:11px;color:var(--red);font-weight:700;min-width:140px" title="Cette adresse e-mail est reconnue comme admin directement dans l'application et dans les règles Firestore : son rôle ne peut pas être modifié ici.">🔒 Admin permanent (adresse codée en dur)</span>` : `<select onchange="changeUserRole('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer le rôle de ${u.email||u.id}">
         <option value="spectator" ${u.role==='spectator'||!u.role?'selected':''}>👁 Spectateur</option>
         <option value="scorer" ${u.role==='scorer'?'selected':''}>✏️ Scorer (saisie scores)</option>
         <option value="manager" ${u.role==='manager'?'selected':''}>🛡️ Responsable d'équipe</option>
         <option value="users" ${u.role==='users'?'selected':''}>🧰 Users (réglages, sans gestion du staff)</option>
         <option value="admin" ${u.role==='admin'?'selected':''}>👑 Admin</option>
-      </select>
+      </select>`}
       ${u.role==='manager' ? `<select onchange="changeUserTeam('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer l'équipe gérée">
         ${teams.map(t=>`<option value="${t.id}" ${t.id===u.teamId?'selected':''}>${t.name}</option>`).join('')}
       </select>` : ''}
