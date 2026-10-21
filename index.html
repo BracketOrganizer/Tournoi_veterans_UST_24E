@@ -119,8 +119,11 @@ const ST = {
   }
 };
 
-function isAdmin()  { return USER_ROLE === 'admin'; }
-function isScorer() { return USER_ROLE === 'admin' || USER_ROLE === 'scorer'; }
+// Rôles : 'admin' (tout, y compris la gestion du staff) | 'users' (tous les réglages SAUF la gestion du staff)
+//         | 'scorer' (saisie des scores) | 'manager' | 'registrant' | 'spectator'
+function isSuperAdmin(){ return USER_ROLE === 'admin'; }                      // gestion du staff / des rôles : admin uniquement
+function isAdmin()  { return USER_ROLE === 'admin' || USER_ROLE === 'users'; } // accès à tous les réglages de l'appli
+function isScorer() { return USER_ROLE === 'admin' || USER_ROLE === 'users' || USER_ROLE === 'scorer'; }
 function isManager(){ return USER_ROLE === 'manager'; }
 function isLiveBlocked(){ return USER_ROLE === 'spectator' && !ST.liveOpen; }
 
@@ -1582,7 +1585,7 @@ window.signOutRegistrant = async function(){
 };
 
 function roleBadge(role){
-  const map={admin:'👑 Admin',scorer:'✏️ Scorer (saisie scores)',manager:'🛡️ Responsable équipe',spectator:'👁 Spectateur'};
+  const map={admin:'👑 Admin',users:'🧰 Users (réglages)',scorer:'✏️ Scorer (saisie scores)',manager:'🛡️ Responsable équipe',spectator:'👁 Spectateur'};
   return map[role]||role;
 }
 
@@ -1602,6 +1605,8 @@ function applyRoleUI(){
   const stepNav = document.getElementById('stepNav');
   if(stepNav) stepNav.style.display = (isSpec || isManager()) ? 'none' : '';
   document.querySelectorAll('[data-role="admin"]').forEach(el=>{ el.style.display = isAdmin() ? '' : 'none'; });
+  document.querySelectorAll('[data-role="superadmin"]').forEach(el=>{ el.style.display = isSuperAdmin() ? '' : 'none'; });
+  if(!isSuperAdmin()){ const up=document.getElementById('usersPanel'); if(up) up.style.display='none'; }
   document.querySelectorAll('[data-role="scorer"]').forEach(el=>{ el.style.display = isScorer() ? '' : 'none'; });
   document.querySelectorAll('[data-role="manager"]').forEach(el=>{ el.style.display = isManager() ? '' : 'none'; });
   updateStepVisibility();
@@ -2010,7 +2015,7 @@ window.rejectRegistration = async function(uid){
 // GESTION DU STAFF — changer les rôles (admin / scorer / spectator)
 // ══════════════════════════════════════════════════════════
 window.toggleUsersPanel = function(){
-  if(!isAdmin()) return;
+  if(!isSuperAdmin()) return; // réservé aux admins (rôle « Users » exclu)
   const p=document.getElementById('usersPanel');
   if(!p) return;
   const show = p.style.display==='none';
@@ -2031,7 +2036,7 @@ function populateNewStaffTeamSelect(){
 }
 
 window.loadUsersList = async function(){
-  if(!isAdmin()) return;
+  if(!isSuperAdmin()) return; // réservé aux admins (rôle « Users » exclu)
   const el=document.getElementById('usersList');
   if(el) el.innerHTML='<div class="info info-b" style="font-size:12px">Chargement…</div>';
   try {
@@ -2053,7 +2058,7 @@ window.loadUsersList = async function(){
 function renderUsersList(users){
   const el=document.getElementById('usersList'); if(!el) return;
   if(!users.length){ el.innerHTML='<div class="info info-y" style="font-size:12px">Aucun compte enregistré pour le moment (les comptes apparaissent ici après leur 1ère connexion).</div>'; return; }
-  const roleColor = r => r==='admin' ? 'var(--red)' : r==='scorer' ? 'var(--blu)' : r==='manager' ? 'var(--ylw)' : 'var(--muted)';
+  const roleColor = r => r==='admin' ? 'var(--red)' : r==='users' ? 'var(--grn)' : r==='scorer' ? 'var(--blu)' : r==='manager' ? 'var(--ylw)' : 'var(--muted)';
   const limit=ST.cfg.n||ST.teams.length;
   const teams=ST.teams.slice(0,limit);
   el.innerHTML = users.map(u=>`
@@ -2067,6 +2072,7 @@ function renderUsersList(users){
         <option value="spectator" ${u.role==='spectator'||!u.role?'selected':''}>👁 Spectateur</option>
         <option value="scorer" ${u.role==='scorer'?'selected':''}>✏️ Scorer (saisie scores)</option>
         <option value="manager" ${u.role==='manager'?'selected':''}>🛡️ Responsable d'équipe</option>
+        <option value="users" ${u.role==='users'?'selected':''}>🧰 Users (réglages, sans gestion du staff)</option>
         <option value="admin" ${u.role==='admin'?'selected':''}>👑 Admin</option>
       </select>
       ${u.role==='manager' ? `<select onchange="changeUserTeam('${u.id}', this.value)" style="width:auto;min-width:140px" title="Changer l'équipe gérée">
@@ -2077,7 +2083,7 @@ function renderUsersList(users){
 }
 
 window.changeUserRole = async function(userId, newRole){
-  if(!isAdmin()) return;
+  if(!isSuperAdmin()) return; // réservé aux admins (rôle « Users » exclu)
   try {
     const patch = { role: newRole };
     if(newRole!=='manager'){ patch.teamId = null; patch.tournament = null; }
@@ -2091,7 +2097,7 @@ window.changeUserRole = async function(userId, newRole){
 };
 
 window.changeUserTeam = async function(userId, teamId){
-  if(!isAdmin()) return;
+  if(!isSuperAdmin()) return; // réservé aux admins (rôle « Users » exclu)
   try {
     await updateDoc(doc(db,'users',userId), { teamId });
     loadUsersList();
@@ -2627,7 +2633,7 @@ function renderTeamRefPanel(){
 // dans le navigateur (comportement du SDK Firebase) : on doit donc reconnecter
 // l'admin juste après avec son propre mot de passe.
 window.createStaffAccount = async function(){
-  if(!isAdmin()) return;
+  if(!isSuperAdmin()) return; // réservé aux admins (rôle « Users » exclu)
   const name      = document.getElementById('newStaffName').value.trim();
   const email     = document.getElementById('newStaffEmail').value.trim();
   const pwd       = document.getElementById('newStaffPwd').value;
@@ -5082,7 +5088,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
     <button class="btn btn-g btn-sm" id="liveToggleBtn" onclick="toggleLiveOpen()">🔴 Live fermé (spectateurs)</button>
     <button class="btn btn-g btn-sm" id="regToggleBtn" onclick="toggleRegistrationsOpen()">🔴 Inscriptions fermées</button>
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('TV')">📺 Mode Écran (affichage)</button>
-    <button class="btn btn-b btn-sm" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
+    <button class="btn btn-b btn-sm" data-role="superadmin" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
     <button class="btn btn-b btn-sm" id="regPanelBtn" onclick="toggleRegistrationsPanel()">📝 Inscriptions</button>
     <button class="btn btn-b btn-sm" id="refArbitresBtn" onclick="toggleRefereesPanel()">🧑‍⚖️ Gérer les arbitres</button>
     <button class="btn btn-b btn-sm" id="teamRefBtn" onclick="toggleTeamRefPanel()">⚽ Arbitrage par équipe</button>
@@ -5127,6 +5133,7 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
         <input type="text" id="newStaffName" placeholder="Nom complet">
         <select id="newStaffRole" onchange="document.getElementById('newStaffTeamWrap').style.display=this.value==='manager'?'':'none'">
           <option value="scorer" selected>✏️ Scorer (saisie scores)</option>
+          <option value="users">🧰 Users (tous les réglages, sans gestion du staff)</option>
           <option value="admin">👑 Admin</option>
           <option value="manager">🛡️ Responsable d'équipe</option>
           <option value="spectator">👁 Spectateur</option>
