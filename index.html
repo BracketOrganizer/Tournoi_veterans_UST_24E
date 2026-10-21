@@ -1463,14 +1463,70 @@ window.resetAllResults = async function(){
   refreshCurrentPage();
 };
 
+// ══════════════════════════════════════════════════════════
+// NETTOYAGE DES INSCRIPTIONS (nouvelle édition)
+// ══════════════════════════════════════════════════════════
+// Efface UNIQUEMENT les fiches d'inscription en ligne de CE tournoi (role 'registrant' : en attente ou refusées).
+// Ne touche NI aux comptes responsables (role 'manager'), NI aux équipes, joueurs ou feuilles d'équipe.
+// Chaque suppression est comptée ; toute erreur est remontée (jamais silencieuse).
+const REG_TOURNAMENT_TAG = 'foot24';
+async function cleanOldRegistrations(){
+  const res = { inscriptions:0, errors:[] };
+  let snap;
+  try { snap = await getDocs(collection(db,'users')); }
+  catch(e){
+    console.error('cleanOldRegistrations (lecture)', e);
+    res.errors.push('Lecture des inscriptions impossible : ' + (e.code||'') + ' ' + (e.message||e));
+    return res;
+  }
+  const targets = [];
+  snap.forEach(d=>{ const u = d.data(); if(u && u.role==='registrant' && u.tournament===REG_TOURNAMENT_TAG) targets.push({ id:d.id, label:(u.teamName||u.email||d.id) }); });
+  for(const t of targets){
+    try { await deleteDoc(doc(db,'users',t.id)); res.inscriptions++; }
+    catch(e){
+      console.error('cleanOldRegistrations (suppression)', t, e);
+      res.errors.push(t.label + ' : ' + (e.code||'') + ' ' + (e.message||e));
+    }
+  }
+  return res;
+}
+function cleanRegistrationsReport(r){
+  const n = r.inscriptions;
+  let t = n>0 ? `🧹 ${n} inscription${n>1?'s':''} effacée${n>1?'s':''}` : '🧹 Aucune inscription à effacer';
+  if(r.errors.length) t += `\n\n⚠️ ${r.errors.length} échec${r.errors.length>1?'s':''} :\n- ` + r.errors.join('\n- ');
+  return t;
+}
+window.cleanRegistrationsManual = async function(){
+  if(!isAdmin()){ alert('Réservé aux admins / Users.'); return; }
+  if(!confirm("Effacer les inscriptions en ligne (en attente ou refusées) de l'ancien tournoi ?\n\nLes comptes responsables, les équipes et les joueurs déjà dans le tournoi ne sont PAS touchés.")) return;
+  const btn = document.getElementById('regCleanBtn'), out = document.getElementById('regCleanResult');
+  if(btn) btn.disabled = true;
+  if(out){ out.style.color='var(--muted)'; out.textContent = '⏳ Nettoyage en cours…'; }
+  let r;
+  try { r = await cleanOldRegistrations(); }
+  catch(e){ r = { inscriptions:0, errors:['Erreur inattendue : ' + (e.message||e)] }; }
+  const txt = cleanRegistrationsReport(r);
+  if(out){ out.style.color = r.errors.length ? 'var(--red)' : 'var(--grn)'; out.textContent = txt; }
+  if(r.errors.length) alert(txt);
+  if(btn) btn.disabled = false;
+  try { loadRegistrations(); } catch(e){}
+};
+
 window.newTournament = async function(){
   if(!isAdmin()){ alert('Admin uniquement.'); return; }
-  if(!confirm('Nouveau tournoi ? Toutes les données (équipes, poules, scores) seront définitivement supprimées.')) return;
+  if(!confirm('Nouveau tournoi ? Toutes les données (équipes, poules, scores) seront définitivement supprimées, ainsi que les inscriptions en ligne en attente ou refusées. Les comptes responsables sont conservés.')) return;
+  // 1) D'ABORD : effacer les inscriptions de l'ancienne édition (chaque suppression est comptée, toute erreur est affichée)
+  let _clean;
+  try { _clean = await cleanOldRegistrations(); }
+  catch(e){ _clean = { inscriptions:0, errors:['Erreur inattendue : '+(e.message||e)] }; }
   ST.teams=[]; ST.pools={A:[],B:[],C:[],D:[]}; ST.poolSchedule=[]; ST.bracketSchedule=[];
   ST.results={}; ST.phase='pools'; ST.activeView='pools'; ST.activePoolRound=0; ST.activeBracketRound=1;
   ST.registrationsOpen = false;
   await saveTournament({ teams:[], pools:{A:[],B:[],C:[],D:[]}, poolSchedule:[], bracketSchedule:[], results:{}, phase:'pools', liveOpen:false, registrationsOpen:false });
   goTo(1);
+  const _msg = cleanRegistrationsReport(_clean);
+  if(_clean.errors.length) alert(_msg); else alert(_msg + '\n\n✅ Nouveau tournoi prêt.');
+  try { loadRegistrations(); } catch(e){}
 };
 
 // ══════════════════════════════════════════════════════════
@@ -5130,6 +5186,12 @@ body.tv-mode .hdr-drawer-overlay{ display:none!important; }
       <button class="btn btn-ghost btn-xs" onclick="loadRegistrations()">🔄 Actualiser</button>
     </div>
     <div id="registrationsList"></div>
+    <details style="margin-top:14px;border:1px solid var(--bdr);border-radius:8px;padding:8px 12px">
+      <summary style="cursor:pointer;font-weight:700;font-size:13px">🧹 Nouvelle édition : effacer les inscriptions de l'ancien tournoi</summary>
+      <div style="font-size:12px;color:var(--muted);margin:8px 0;line-height:1.6">Supprime les inscriptions en ligne <b>en attente ou refusées</b> de ce tournoi, pour repartir proprement. <b>Conservés :</b> les comptes responsables, les équipes et les joueurs déjà dans le tournoi. Ce nettoyage est aussi fait automatiquement par « 🆕 Nouveau tournoi » ; ce bouton permet de le refaire à tout moment.</div>
+      <button class="btn btn-r btn-sm" id="regCleanBtn" onclick="cleanRegistrationsManual()">🧹 Effacer les inscriptions de l'ancien tournoi</button>
+      <div id="regCleanResult" style="white-space:pre-wrap;font-size:12px;margin-top:8px"></div>
+    </details>
   </div>
   <div id="refereesPanel" style="display:none;margin-top:14px;border-top:1px solid var(--bdr);padding-top:14px">
     <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;flex-wrap:wrap">
