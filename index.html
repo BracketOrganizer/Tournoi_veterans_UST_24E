@@ -886,11 +886,13 @@ function isMyTeam(teamId){
 // Sauvegarde la liste des joueurs d'une équipe. Autorisé pour l'admin/scorer
 // (n'importe quelle équipe) ou pour le manager assigné (sa propre équipe seulement,
 // imposé aussi côté règles Firestore).
-async function saveRoster(teamId, players){
+async function saveRoster(teamId, players, referees){
   if(!isAdmin() && !isScorer() && !(isManager() && isMyTeam(teamId))) return;
   try {
-    await setDoc(doc(db,'teamRosters24',teamId), { players, updatedAt: serverTimestamp() }, { merge:true });
-    ROSTERS[teamId] = { players };
+    const data = { players, updatedAt: serverTimestamp() };
+    if(Array.isArray(referees)) data.referees = referees; // arbitres de l'équipe (arbitrage tournant)
+    await setDoc(doc(db,'teamRosters',teamId), data, { merge:true });
+    ROSTERS[teamId] = { ...(ROSTERS[teamId]||{}), players, ...(Array.isArray(referees) ? { referees } : {}) };
   } catch(e){
     console.error('saveRoster', e);
     alert('Erreur de sauvegarde de la feuille d\'équipe : '+e.message);
@@ -2857,18 +2859,34 @@ window.toggleTeamRefPanel = function(){
 // manque ou ce qui est devenu invalide — peut donc être relancé sans risque
 // après chaque tour de la phase finale (au fur et à mesure que les équipes
 // se déterminent).
+// Équipes qui jouent à l'horaire `time` (poules + phase finale dont les équipes sont connues)
+function teamsPlayingAtTime(time){
+  const set = new Set(); if(!time) return set;
+  ST.poolSchedule.forEach(m=>{ if(m.time===time){ set.add(m.a); set.add(m.b); } });
+  ST.bracketSchedule.forEach(b=>{ if(b.time===time){ const a=bracketTeam(b.m,'a'), c=bracketTeam(b.m,'b'); if(a) set.add(a); if(c) set.add(c); } });
+  return set;
+}
+// Liste déroulante du panneau : les équipes libres d'abord, celles qui jouent au même moment signalées ⚠️
+function teamRefOptionsHTML(options, current, time){
+  const playing = teamsPlayingAtTime(time);
+  return options.slice().sort((x,y)=>(playing.has(x.id)?1:0)-(playing.has(y.id)?1:0))
+    .map(t=>`<option value="${t.id}" ${t.id===current?'selected':''}>${t.name}${playing.has(t.id)?' ⚠️ joue à ce moment':''}</option>`).join('');
+}
+
 window.generateTeamRefereeAssignments = function(){
   if(!isAdmin()) return;
   const assignments = { ...(ST.teamRefereeAssignments||{}) };
   const refCounts = {};
   const pairSeen = {};
+  const refBusy = {}; // refBusy[horaire] = équipes déjà désignées comme arbitres à cet horaire
   ST.teams.forEach(t=>{ refCounts[t.id]=0; pairSeen[t.id]=new Set(); });
 
-  function record(refTeam, a, b){
+  function record(refTeam, a, b, time){
     if(!refTeam) return;
     refCounts[refTeam] = (refCounts[refTeam]||0)+1;
     if(!pairSeen[refTeam]) pairSeen[refTeam]=new Set();
     pairSeen[refTeam].add(a); pairSeen[refTeam].add(b);
+    if(time){ (refBusy[time] = refBusy[time] || new Set()).add(refTeam); }
   }
   function pick(eligible, a, b){
     if(!eligible.length) return null;
@@ -2880,18 +2898,27 @@ window.generateTeamRefereeAssignments = function(){
     scored.sort((x,y)=> x.conflict-y.conflict || x.count-y.count);
     return scored[0].id;
   }
+  // L'équipe arbitre ne doit pas jouer au même moment (ni arbitrer déjà un autre match à ce moment) :
+  // on choisit d'abord parmi les équipes libres ; si aucune ne l'est, on assouplit pas à pas.
+  function isFree(id, time){ return !teamsPlayingAtTime(time).has(id) && !(refBusy[time] && refBusy[time].has(id)); }
+  function pickFree(eligible, a, b, time){
+    let tier = eligible.filter(id=>isFree(id, time));
+    if(!tier.length) tier = eligible.filter(id=>!teamsPlayingAtTime(time).has(id));
+    if(!tier.length) tier = eligible;
+    return pick(tier, a, b);
+  }
 
   // 1) Phase de poules — traitée dans l'ordre des matchs
   ST.poolSchedule.slice().sort((x,y)=>(x.matchId||0)-(y.matchId||0)).forEach(m=>{
     const key = 'pool-'+m.matchId;
     const eligible = ST.teams.map(t=>t.id).filter(id=> poolOfTeam(id)!==m.pool);
     const existing = assignments[key];
-    if(existing && eligible.includes(existing) && existing!==m.a && existing!==m.b){
-      record(existing, m.a, m.b);
+    if(existing && eligible.includes(existing) && existing!==m.a && existing!==m.b && isFree(existing, m.time)){
+      record(existing, m.a, m.b, m.time);
     } else {
-      const chosen = pick(eligible, m.a, m.b);
+      const chosen = pickFree(eligible, m.a, m.b, m.time);
       assignments[key] = chosen;
-      record(chosen, m.a, m.b);
+      record(chosen, m.a, m.b, m.time);
     }
   });
 
@@ -2903,12 +2930,12 @@ window.generateTeamRefereeAssignments = function(){
     const eligible = ST.teams.map(t=>t.id).filter(id=>
       id!==teamA && id!==teamB && !teamPlaysBracketAtTime(id, b.time, key));
     const existing = assignments[key];
-    if(existing && eligible.includes(existing)){
-      record(existing, teamA, teamB);
+    if(existing && eligible.includes(existing) && isFree(existing, b.time)){
+      record(existing, teamA, teamB, b.time);
     } else {
-      const chosen = pick(eligible, teamA, teamB);
+      const chosen = pickFree(eligible, teamA, teamB, b.time);
       assignments[key] = chosen;
-      record(chosen, teamA, teamB);
+      record(chosen, teamA, teamB, b.time);
     }
   });
 
@@ -2945,7 +2972,7 @@ function renderTeamRefPanel(){
       <span style="min-width:180px">Poule ${m.pool} · ${tName(m.a)} – ${tName(m.b)} <span style="color:var(--dim)">(${m.time||''})</span></span>
       <select onchange="setTeamReferee('${key}',this.value)">
         <option value="">— aucune —</option>
-        ${options.map(t=>`<option value="${t.id}" ${t.id===current?'selected':''}>${t.name}</option>`).join('')}
+        ${teamRefOptionsHTML(options, current, m.time)}
       </select>
     </div>`;
   }).join('');
@@ -2965,7 +2992,7 @@ function renderTeamRefPanel(){
       <span style="min-width:180px">${bracketLabel(b.m)} · ${tName(teamA)} – ${tName(teamB)} <span style="color:var(--dim)">(${b.time||''})</span></span>
       <select onchange="setTeamReferee('${key}',this.value)">
         <option value="">— aucune —</option>
-        ${options.map(t=>`<option value="${t.id}" ${t.id===current?'selected':''}>${t.name}</option>`).join('')}
+        ${teamRefOptionsHTML(options, current, b.time)}
       </select>
     </div>`;
   }).join('');
@@ -2973,7 +3000,7 @@ function renderTeamRefPanel(){
   el.innerHTML = `
     <div style="margin-bottom:12px">
       <button class="btn btn-g btn-sm" onclick="generateTeamRefereeAssignments()">🔄 Générer / mettre à jour les arbitrages</button>
-      <div style="font-size:10px;color:var(--dim);margin-top:4px">Relancez ce bouton après chaque tour de phase finale pour compléter les matchs nouvellement déterminés.</div>
+      <div style="font-size:10px;color:var(--dim);margin-top:4px">L'équipe arbitre est choisie, quand c'est possible, parmi celles qui ne jouent pas au même moment. Relancez ce bouton après chaque tour de phase finale pour compléter les matchs nouvellement déterminés.</div>
     </div>
     ${ST.poolSchedule.length ? `<div style="font-weight:700;font-size:12px;margin:10px 0 6px">🏊 Phase de poules</div>${poolRows}` : ''}
     ${ST.bracketSchedule.length ? `<div style="font-weight:700;font-size:12px;margin:14px 0 6px">🏆 Phase finale</div>${bracketRows}` : ''}
@@ -2992,60 +3019,59 @@ window.createStaffAccount = async function(){
   const pwd       = document.getElementById('newStaffPwd').value;
   const role      = document.getElementById('newStaffRole').value;
   const teamId    = document.getElementById('newStaffTeamId') ? document.getElementById('newStaffTeamId').value : null;
-  const adminPwd  = document.getElementById('adminPwdConfirm').value;
   const msgEl     = document.getElementById('newStaffMsg');
   const setMsg = (txt,color)=>{ if(msgEl){ msgEl.textContent=txt; msgEl.style.color = color==='red'?'var(--red)':'var(--grn)'; } };
 
   if(!name||!email||!pwd){ setMsg('Remplissez nom, email et mot de passe.','red'); return; }
   if(pwd.length<6){ setMsg('Le mot de passe doit faire au moins 6 caractères.','red'); return; }
   if(role==='manager' && !teamId){ setMsg('Sélectionnez l\'équipe gérée par ce responsable.','red'); return; }
-  if(!adminPwd){ setMsg('Indiquez votre propre mot de passe admin pour la reconnexion automatique.','red'); return; }
-
   const adminEmail = CURRENT_USER ? CURRENT_USER.email : null;
-  if(!adminEmail){ setMsg('Reconnectez-vous en admin (email/mot de passe) avant de créer un compte staff.','red'); return; }
 
   setMsg('Création en cours…','grn');
-  STAFF_CREATING = true;
+  let secApp = null, uid = null, existing = false;
   try {
-    // 1. Crée le compte Auth (connecte automatiquement ce nouveau compte)
-    const cred = await createUserWithEmailAndPassword(auth, email, pwd);
-    const newUid = cred.user.uid;
-    await updateProfile(cred.user, { displayName: name });
-
-    // 2. Crée la fiche Firestore en 'spectator' uniquement — c'est le SEUL rôle
-    // qu'un compte est autorisé à s'auto-attribuer à la création (règle Firestore).
-    // On ne peut pas écrire directement le rôle choisi ici : à ce stade, c'est le
-    // NOUVEAU compte qui est connecté (request.auth.uid == newUid), pas l'admin.
-    await setDoc(doc(db,'users',newUid), {
-      email, name, role:'spectator', createdAt: serverTimestamp(), createdBy: adminEmail
-    });
-
-    // 3. Reconnecte l'admin avec son propre mot de passe
-    await signInWithEmailAndPassword(auth, adminEmail, adminPwd);
-
-    // 4. Maintenant reconnecté en admin : promeut le compte au rôle choisi via
-    // update (autorisé par la règle Firestore uniquement pour un admin).
-    if(role !== 'spectator'){
-      const patch = { role };
-      if(role==='manager'){ patch.teamId = teamId; patch.tournament = 'foot24'; }
-      await updateDoc(doc(db,'users',newUid), patch);
+    // 1. Compte Firebase Authentication créé via une 2ᵉ instance de l'appli :
+    //    la session de l'admin n'est JAMAIS interrompue (plus besoin de son mot de passe).
+    try {
+      secApp = initializeApp(firebaseConfig, 'sec_' + Date.now());
+      const secAuth = getAuth(secApp);
+      const cred = await createUserWithEmailAndPassword(secAuth, email, pwd);
+      uid = cred.user.uid;
+      try { await updateProfile(cred.user, { displayName: name }); } catch(e){}
+      try { await signOut(secAuth); } catch(e){}
+    } catch(e){
+      if(e.code !== 'auth/email-already-in-use') throw e;
+      existing = true;
+    } finally {
+      if(secApp){ try { await deleteApp(secApp); } catch(e){} }
     }
 
-    setMsg(`✓ Compte staff créé pour ${name} (${roleBadge(role)}${role==='manager'?' — '+tName(teamId):''}). Vous êtes reconnecté en admin.`,'grn');
+    // 2. Fiche Firestore avec le rôle choisi, écrite directement par l'admin connecté.
+    if(existing){
+      // Adresse déjà connue : on retrouve sa fiche et on lui attribue le rôle choisi.
+      const snap = await getDocs(collection(db,'users'));
+      let found = null;
+      snap.forEach(d=>{ const u=d.data(); if((u.email||'').toLowerCase()===email.toLowerCase()) found = { id:d.id, ...u }; });
+      if(!found){ setMsg("Cette adresse e-mail a déjà un compte, mais sans fiche : demandez à la personne de se connecter une fois, elle apparaîtra alors dans la liste ci-dessous et vous pourrez choisir son rôle.",'red'); return; }
+      if(!confirm(`${email} existe déjà (rôle actuel : ${found.role}).\n\nLui attribuer le rôle « ${roleBadge(role)} » ?`)){ setMsg('Annulé.','red'); return; }
+      uid = found.id;
+      const patch = { role, teamId: role==='manager' ? teamId : null, tournament: role==='manager' ? REG_TOURNAMENT_TAG : null };
+      if(role==='manager'){ patch.extraTeamIds = []; patch.regStatus = 'approved'; }
+      await updateDoc(doc(db,'users',uid), patch);
+    } else {
+      const data = { email, name, role, createdAt: serverTimestamp(), createdBy: adminEmail };
+      if(role==='manager'){ data.teamId = teamId; data.extraTeamIds = []; data.tournament = REG_TOURNAMENT_TAG; data.regStatus = 'approved'; }
+      await setDoc(doc(db,'users',uid), data);
+    }
+
+    setMsg(`✓ ${existing?'Rôle mis à jour':'Compte staff créé'} pour ${name} (${roleBadge(role)}${role==='manager'?' — '+tName(teamId):''}).`,'grn');
     document.getElementById('newStaffName').value='';
     document.getElementById('newStaffEmail').value='';
     document.getElementById('newStaffPwd').value='';
-    document.getElementById('adminPwdConfirm').value='';
     loadUsersList();
   } catch(e){
     console.error('createStaffAccount', e);
     setMsg('Erreur : '+authErrMsg(e.code)+(e.code?'':(' '+e.message)),'red');
-    // Si la reconnexion admin a échoué après une création réussie, on prévient clairement.
-    if(auth.currentUser && auth.currentUser.email !== adminEmail){
-      setMsg('Compte staff créé, mais la reconnexion admin a échoué (mot de passe admin incorrect ?). Reconnectez-vous manuellement.','red');
-    }
-  } finally {
-    setTimeout(()=>{ STAFF_CREATING = false; }, 4000); // laisse passer les événements d'authentification tardifs
   }
 };
 
@@ -3163,6 +3189,21 @@ function renderCfgForm(){
   renderBreaksList();
   onCfgChange();
 }
+// Cases « arbitres officiels » / « arbitrage tournant » : enregistrées immédiatement, pour que les boutons
+// « Gérer les arbitres » et « Arbitrage par équipe » du panneau Admin fonctionnent tout de suite.
+window.onRefFlagsChange = function(){
+  onCfgChange();
+  const rOn = !!document.getElementById('cfg_refon')?.checked, tOn = !!document.getElementById('cfg_teamrefon')?.checked;
+  if(!isAdmin()) return;
+  if(rOn !== !!ST.cfg.refereesEnabled || tOn !== !!ST.cfg.teamRefereeingEnabled){
+    ST.cfg = { ...ST.cfg, refereesEnabled: rOn, teamRefereeingEnabled: tOn };
+    saveTournament({ cfg: ST.cfg }).catch(e=>console.error('onRefFlagsChange', e));
+  }
+  try { updateRefereesBtnVisibility(); } catch(e){}
+  try { updateTeamRefBtnVisibility(); } catch(e){}
+  if(!rOn){ const p=document.getElementById('refereesPanel'); if(p) p.style.display='none'; }
+  if(!tOn){ const p=document.getElementById('teamRefPanel'); if(p) p.style.display='none'; }
+};
 window.onCfgChange = function(){
   toggleRefPerCourtVisibility();
   const n = +(document.getElementById('cfg_n')?.value||16);
@@ -3387,28 +3428,87 @@ window.regeneratePoolSchedule = function(){
   buildPoolSchedule();
 };
 
+// ══════════════════════════════════════════════════════════
+// IMPRESSIONS — aucun bloc (créneau, poule, tour, fiche d'équipe) n'est coupé entre deux feuilles
+// ══════════════════════════════════════════════════════════
+const PRINT_CSS = `*{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial,sans-serif;font-size:12px;padding:12px}
+  table{width:100%;border-collapse:collapse} th{background:#1a2540;color:#fff;padding:5px 8px;text-align:left;font-size:11px} td{padding:5px 8px;border-bottom:1px solid #ddd}
+  thead{display:table-header-group} tr,.slot,.block,.fiche{break-inside:avoid;page-break-inside:avoid}
+  .slothdr td{background:#0d1a2e;color:#fff;font-weight:700;padding:6px 10px;break-after:avoid;page-break-after:avoid}
+  h2{margin-bottom:8px} .blk-ttl{font-size:15px;margin:0 0 2px;color:#1a2540} .sub{font-size:10px;color:#555;margin-bottom:5px} .block{margin-bottom:16px}
+  .c{text-align:center} .sc{display:inline-block;min-width:54px;text-align:center;font-weight:700} .blank{display:inline-block;width:20px;border-bottom:1px solid #444}
+  .bar{padding:8px;background:#f0f4fa;display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+  .btn{padding:6px 18px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer}
+  body.opp .block{break-after:page;page-break-after:always} body.opp .blocks > .block:last-child{break-after:auto;page-break-after:auto}
+  @media print{ @page{size:A4;margin:8mm} .noprint{display:none!important} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} th,.slothdr td{background:#1a2540!important;color:#fff!important} .slothdr td{background:#0d1a2e!important} body{padding:0} }`;
+function openPrintWindow(name, title, css, bodyHTML, bodyClass, delay){
+  const win = window.open('', name, 'width=1000,height=750');
+  if(!win){ alert('Autorisez les fenêtres pop-up de ce site pour lancer l\'impression.'); return null; }
+  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>${title}</title><style>${css}</style></head><body${bodyClass?` class="${bodyClass}"`:''}>${bodyHTML}</body></html>`);
+  win.document.close(); setTimeout(()=>win.print(), delay||400);
+  return win;
+}
+const PRINT_BAR = (label)=>`<div class="noprint bar"><strong>${label}</strong>
+    <label><input type="checkbox" checked onchange="document.body.classList.toggle('opp',this.checked)"> Une section par page</label>
+    <button class="btn" onclick="window.print()">🖨 Imprimer</button></div>`;
+function printScoreCell(r){
+  const done = r && r.ga!=='' && r.gb!=='';
+  return done ? `<span class="sc">${r.ga} – ${r.gb}</span>` : `<span class="sc"><span class="blank"></span> – <span class="blank"></span></span>`;
+}
+
 window.printPoolSchedule = function(){
   if(!ST.poolSchedule.length){ alert('Aucun planning généré.'); return; }
   const bySlot = {};
   ST.poolSchedule.forEach(m=>{ (bySlot[m.slot]=bySlot[m.slot]||[]).push(m); });
   const slots = Object.keys(bySlot).map(Number).sort((a,b)=>a-b);
-  const rows = slots.map(s=>{
-    const matches = bySlot[s];
-    return `<tr style="background:#0d1a2e;color:#fff"><td colspan="4" style="padding:6px 10px;font-weight:700">🕐 ${matches[0].time}</td></tr>` +
-      matches.map(m=>`<tr><td style="padding:4px 8px">T${m.court}</td><td style="padding:4px 8px">Poule ${m.pool}</td><td style="padding:4px 8px" colspan="2"><strong>${tName(m.a)}</strong> vs <strong>${tName(m.b)}</strong></td></tr>`).join('');
+  const body = slots.map(s=>{
+    const matches = bySlot[s].slice().sort((a,b)=>(a.court||0)-(b.court||0));
+    return `<tbody class="slot"><tr class="slothdr"><td colspan="3">🕐 ${matches[0].time}</td></tr>` +
+      matches.map(m=>`<tr><td style="width:60px">T${m.court}</td><td style="width:90px">Poule ${m.pool}</td><td><strong>${tName(m.a)}</strong> vs <strong>${tName(m.b)}</strong></td></tr>`).join('') + `</tbody>`;
   }).join('');
-  const win=window.open('','_planning','width=900,height=700');
-  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Planning Poules</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:12px;padding:14px}
-    table{width:100%;border-collapse:collapse} td{border-bottom:1px solid #ddd}
-    @media print{ @page{size:A4;margin:8mm} .noprint{display:none!important} }
-  </style></head><body>
-  <h2>⚽ Planning Phase de Poules</h2>
-  <table>${rows}</table>
-  <div class="noprint" style="margin-top:12px"><button onclick="window.print()">🖨 Imprimer</button></div>
-  </body></html>`);
-  win.document.close(); setTimeout(()=>win.print(),400);
+  openPrintWindow('_planning','Planning Poules', PRINT_CSS,
+    `<div class="noprint bar"><button class="btn" onclick="window.print()">🖨 Imprimer</button></div><h2>⚽ Planning Phase de Poules</h2><table>${body}</table>`);
+};
+
+// Matchs de chaque poule (un bloc par poule, éventuellement une poule par page)
+window.printMatchesByPool = function(){
+  if(!ST.poolSchedule.length){ alert('Aucun planning généré.'); return; }
+  const pools = [...new Set(ST.poolSchedule.map(m=>m.pool))].sort();
+  const blocks = pools.map(p=>{
+    const ms = ST.poolSchedule.filter(m=>m.pool===p).sort((a,b)=>(a.slot-b.slot)||((a.court||0)-(b.court||0)));
+    const teams = (ST.pools && ST.pools[p]) || [];
+    return `<div class="block"><h3 class="blk-ttl">Poule ${p}</h3>
+      <div class="sub">${teams.map(tName).join(' · ')}</div>
+      <table><thead><tr><th>Heure</th><th>Terrain</th><th>Équipe A</th><th class="c">Score</th><th>Équipe B</th></tr></thead><tbody>
+      ${ms.map(m=>`<tr><td><strong>${m.time}</strong></td><td>T${m.court}</td><td><strong>${tName(m.a)}</strong></td><td class="c">${printScoreCell(getPoolResult(m.matchId))}</td><td><strong>${tName(m.b)}</strong></td></tr>`).join('')}
+      </tbody></table></div>`;
+  }).join('');
+  openPrintWindow('_matchs_poules','Matchs par poule', PRINT_CSS, PRINT_BAR('⚽ Matchs par poule') + `<div class="blocks">${blocks}</div>`, 'opp');
+};
+
+// Texte d'une équipe de phase finale (nom, ou provenance tant qu'elle n'est pas connue)
+function bracketSlotText(m, side){
+  const t = bracketTeam(m, side); if(t) return tName(t);
+  const b = (typeof BRACKET_BY_NUM!=='undefined') ? BRACKET_BY_NUM[m] : null;
+  const sl = b && b[side]; if(!sl) return 'À déterminer';
+  if(sl.pool) return `${sl.rank}${sl.rank===1?'er':'e'} Poule ${sl.pool}`;
+  if(sl.from==='V') return 'Vainqueur ' + bracketLabel(sl.m);
+  if(sl.from==='P') return 'Perdant ' + bracketLabel(sl.m);
+  return 'À déterminer';
+}
+// Matchs de la phase finale, tour par tour (un bloc par tour)
+window.printBracketByRound = function(){
+  if(!ST.bracketSchedule.length){ alert('Phase finale non générée.'); return; }
+  const rounds = [...new Set(ST.bracketSchedule.map(b=>b.round))].sort((a,b)=>a-b);
+  const rl = r=> r===1?'Tour 1':r===2?'Tour 2':'Classement final';
+  const blocks = rounds.map(r=>{
+    const ms = ST.bracketSchedule.filter(b=>b.round===r).sort((x,y)=>(x.slot-y.slot)||((x.court||0)-(y.court||0)));
+    return `<div class="block"><h3 class="blk-ttl">🏆 ${rl(r)}</h3>
+      <table><thead><tr><th>Heure</th><th>Terrain</th><th>Match</th><th>Équipe A</th><th class="c">Score</th><th>Équipe B</th></tr></thead><tbody>
+      ${ms.map(b=>`<tr><td><strong>${b.time||''}</strong></td><td>T${b.court}</td><td style="font-size:10px;color:#555">${b.label||bracketLabel(b.m)}</td><td><strong>${bracketSlotText(b.m,'a')}</strong></td><td class="c">${printScoreCell(getBracketResult(b.m))}</td><td><strong>${bracketSlotText(b.m,'b')}</strong></td></tr>`).join('')}
+      </tbody></table></div>`;
+  }).join('');
+  openPrintWindow('_matchs_finale','Phase finale par tour', PRINT_CSS, PRINT_BAR('🏆 Phase finale par tour') + `<div class="blocks">${blocks}</div>`, 'opp');
 };
 
 // ══════════════════════════════════════════════════════════
@@ -3472,46 +3572,39 @@ window.printTeamSchedule = function(tid){
 window.printTeamScheduleSingle = function(tid){
   const html=printTeamSchedule(tid); if(!html) return;
   const team=tObj(tid); if(!team) return;
-  const win=window.open('','_team_'+tid,'width=900,height=600');
-  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Fiche ${team.name}</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:12px;padding:12px}
+  const css = `*{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:12px;padding:12px}
+    .fiche{break-inside:avoid;page-break-inside:avoid}
     .fiche-hdr{font-size:15px;font-weight:700;margin-bottom:8px;padding-bottom:6px;border-bottom:2px solid #1a2540}
     .fiche-resp{font-size:11px;font-weight:400;color:#444;margin-top:2px}
     table{width:100%;border-collapse:collapse} th{background:#1a2540;color:#fff;padding:5px 8px;text-align:left;font-size:11px}
-    td{padding:5px 8px;border-bottom:1px solid #eee}
+    td{padding:5px 8px;border-bottom:1px solid #eee} tr{break-inside:avoid;page-break-inside:avoid}
     .fiche-bilan{margin-top:8px;font-weight:700;color:#1a2540;background:#f0f4ff;padding:6px 8px;border-radius:4px}
-    @media print{ @page{size:A4;margin:8mm} .noprint{display:none!important} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} tr{-webkit-print-color-adjust:exact;print-color-adjust:exact} }
-  </style></head><body>
-  ${html}
-  <div class="noprint" style="margin-top:14px"><button onclick="window.print()" style="padding:7px 20px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer">🖨 Imprimer</button></div>
-  </body></html>`);
-  win.document.close(); setTimeout(()=>win.print(),400);
+    @media print{ @page{size:A4;margin:8mm} .noprint{display:none!important} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} tr{-webkit-print-color-adjust:exact;print-color-adjust:exact} th{background:#1a2540!important;color:#fff!important} }`;
+  openPrintWindow('_team_'+tid, 'Fiche '+team.name, css,
+    `${html}<div class="noprint" style="margin-top:14px"><button onclick="window.print()" style="padding:7px 20px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer">🖨 Imprimer</button></div>`);
 };
+// Toutes les fiches : 8 fiches par feuille (2 colonnes × 4) — une fiche n'est jamais coupée entre deux feuilles
 window.printAllTeamSchedules = function(){
   const limit = ST.cfg.n||ST.teams.length;
   const fiches=ST.teams.slice(0,limit).map(t=>printTeamSchedule(t.id)).filter(Boolean);
   if(!fiches.length){ alert('Aucune fiche à imprimer.'); return; }
-  const win=window.open('','_allfiches','width=1000,height=750');
-  win.document.write(`<!DOCTYPE html><html><head><meta charset="UTF-8"><title>Fiches équipes</title>
-  <style>
-    *{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:9px}
-    .fiche{border:1px solid #bbb;border-radius:2px;padding:4px 5px;break-inside:avoid}
+  const PER_PAGE = 8, pages = [];
+  for(let i=0;i<fiches.length;i+=PER_PAGE) pages.push(`<div class="page">${fiches.slice(i,i+PER_PAGE).join('')}</div>`);
+  const css = `*{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial;font-size:9px}
+    .fiche{border:1px solid #bbb;border-radius:2px;padding:4px 5px;break-inside:avoid;page-break-inside:avoid}
     .fiche-hdr{font-size:10px;font-weight:700;margin-bottom:2px;padding-bottom:2px;border-bottom:1.5px solid #1a2540}
     .fiche-resp{font-size:8px;font-weight:400;color:#444;margin-top:1px}
     table{width:100%;border-collapse:collapse;font-size:8px} th{background:#1a2540;color:#fff;padding:2px 4px}
-    td{padding:1.5px 4px;border-bottom:1px solid #eee}
+    td{padding:1.5px 4px;border-bottom:1px solid #eee} tr{break-inside:avoid;page-break-inside:avoid}
     .fiche-bilan{margin-top:2px;font-size:9px;font-weight:700;color:#1a2540;text-align:right}
-    .grid{display:grid;grid-template-columns:1fr 1fr;gap:4px;padding:4px}
-    @media print{ @page{size:A4;margin:4mm} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} .noprint{display:none!important} .fiche{page-break-inside:avoid} th{background:#1a2540!important;color:#fff!important} tr{-webkit-print-color-adjust:exact;print-color-adjust:exact} }
-  </style></head><body>
-  <div class="noprint" style="padding:8px;background:#f0f4fa;display:flex;gap:12px;align-items:center">
-    <strong>⚽ Fiches équipes — ${fiches.length} équipes</strong>
-    <button onclick="window.print()" style="padding:6px 18px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer">🖨 Imprimer tout</button>
-  </div>
-  <div class="grid">${fiches.join('')}</div>
-  </body></html>`);
-  win.document.close(); setTimeout(()=>win.print(),500);
+    .page{display:grid;grid-template-columns:1fr 1fr;grid-auto-rows:min-content;align-content:start;gap:4px;padding:4px;break-after:page;page-break-after:always}
+    .page:last-child{break-after:auto;page-break-after:auto}
+    @media print{ @page{size:A4;margin:4mm} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} .noprint{display:none!important} th{background:#1a2540!important;color:#fff!important} tr{-webkit-print-color-adjust:exact;print-color-adjust:exact} }`;
+  openPrintWindow('_allfiches','Fiches équipes', css,
+    `<div class="noprint" style="padding:8px;background:#f0f4fa;display:flex;gap:12px;align-items:center">
+      <strong>⚽ Fiches équipes — ${fiches.length} équipes (8 par feuille)</strong>
+      <button onclick="window.print()" style="padding:6px 18px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer">🖨 Imprimer tout</button>
+    </div>${pages.join('')}`, '', 500);
 };
 
 // ══════════════════════════════════════════════════════════
@@ -4570,6 +4663,7 @@ async function renderManagerPage(){
   const team = tObj(teamId);
   const roster = await getRosterOnce(teamId);
   const players = (roster.players && roster.players.length) ? roster.players : [];
+  const referees = Array.isArray(roster.referees) ? roster.referees : [];
   // On affiche toujours MAX_PLAYERS lignes (vides si besoin) pour saisie facile.
   const rows = [];
   for(let i=0;i<MAX_PLAYERS;i++) rows.push(players[i] || emptyPlayer());
@@ -4598,6 +4692,13 @@ async function renderManagerPage(){
       <span style="font-size:11px;color:var(--muted)">${rows.filter(p=>p.nom||p.prenom||p.licence).length} / ${MAX_PLAYERS} joueurs renseignés</span>
     </div>
     ${(team&&(team.respNom||team.respTel))?`<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${team.respNom?'🛡️ Responsable : <strong style="color:var(--ink)">'+team.respNom+'</strong>':''}${team.respNom&&team.respTel?' · ':''}${team.respTel?'📞 <strong style="color:var(--ink)">'+team.respTel+'</strong>':''}</div>`:''}
+    ${(ST.cfg && ST.cfg.teamRefereeingEnabled) ? `<div style="margin:0 0 12px;padding:10px 12px;background:var(--s2);border:1px solid var(--bdr);border-radius:10px">
+      <div style="font-size:12px;font-weight:700;margin-bottom:6px">🧑‍⚖️ Arbitre(s) de l'équipe <span style="font-weight:400;color:var(--muted)">(arbitrage tournant — 1 ou 2 personnes)</span></div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <input type="text" id="rost_ref_0" value="${(referees[0]||'').replace(/"/g,'&quot;')}" placeholder="Nom de l'arbitre 1" style="flex:1;min-width:160px">
+        <input type="text" id="rost_ref_1" value="${(referees[1]||'').replace(/"/g,'&quot;')}" placeholder="Nom de l'arbitre 2 (facultatif)" style="flex:1;min-width:160px">
+      </div>
+    </div>` : ''}
     <div id="rosterMsg" style="font-size:12px;min-height:16px;margin-bottom:6px"></div>
     <div style="overflow-x:auto">
     <table class="stbl" style="width:100%;min-width:480px">
@@ -4645,8 +4746,13 @@ window.submitRoster = async function(teamId){
     const licence=(document.getElementById(`rost_licence_${i}`)?.value||'').trim();
     if(nom||prenom||licence) players.push({ nom, prenom, licence });
   }
-  await saveRoster(teamId, players);
-  setMsg(`✓ Feuille d'équipe enregistrée (${players.length} joueur${players.length>1?'s':''}).`, 'grn');
+  // Arbitres de l'équipe : uniquement si l'arbitrage tournant par les équipes est activé
+  let referees;
+  if(ST.cfg && ST.cfg.teamRefereeingEnabled){
+    referees = [0,1].map(i=>(document.getElementById(`rost_ref_${i}`)?.value||'').trim()).filter(Boolean);
+  }
+  await saveRoster(teamId, players, referees);
+  setMsg(`✓ Feuille d'équipe enregistrée (${players.length} joueur${players.length>1?'s':''}${referees?` · ${referees.length} arbitre${referees.length>1?'s':''}`:''}).`, 'grn');
 };
 
 
@@ -5454,8 +5560,8 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('TV')">📺 Mode Écran (affichage)</button>
     <button class="btn btn-b btn-sm" data-role="superadmin" onclick="toggleUsersPanel()">👥 Gérer le staff</button>
     <button class="btn btn-b btn-sm" id="regPanelBtn" onclick="toggleRegistrationsPanel()">🏟️ Inscription des équipes</button>
-    <button class="btn btn-b btn-sm" id="refArbitresBtn" onclick="toggleRefereesPanel()">🧑‍⚖️ Gérer les arbitres</button>
-    <button class="btn btn-b btn-sm" id="teamRefBtn" onclick="toggleTeamRefPanel()">⚽ Arbitrage par équipe</button>
+    <button class="btn btn-b btn-sm" id="refArbitresBtn" style="display:none" onclick="toggleRefereesPanel()">🧑‍⚖️ Gérer les arbitres</button>
+    <button class="btn btn-b btn-sm" id="teamRefBtn" style="display:none" onclick="toggleTeamRefPanel()">⚽ Arbitrage par équipe</button>
     <button class="btn btn-b btn-sm" onclick="toggleAdminPanel();goTo('M')">📋 Feuilles d'équipe</button>
     <button class="btn btn-y btn-sm" onclick="resetAllResults()">🔄 Réinitialiser tous les scores</button>
     <button class="btn btn-r btn-sm" onclick="newTournament()">🆕 Nouveau tournoi</button>
@@ -5549,10 +5655,6 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
         <label style="font-size:11px;color:var(--muted)">Équipe gérée par ce responsable</label>
         <select id="newStaffTeamId"></select>
       </div>
-      <div style="margin-bottom:8px">
-        <label style="font-size:11px;color:var(--muted)">Votre mot de passe admin (pour vous reconnecter automatiquement après création)</label>
-        <input type="password" id="adminPwdConfirm" placeholder="Votre mot de passe admin">
-      </div>
       <button class="btn btn-g btn-sm" onclick="createStaffAccount()">✓ Créer le compte staff</button>
     </div>
   </div>
@@ -5613,11 +5715,11 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
       </div>
       <div class="fr">
         <div style="display:flex;align-items:center;gap:8px;padding-top:6px">
-          <input type="checkbox" id="cfg_refon" style="width:auto" oninput="onCfgChange()">
+          <input type="checkbox" id="cfg_refon" style="width:auto" oninput="onRefFlagsChange()">
           <label for="cfg_refon" style="margin:0;cursor:pointer">🧑‍⚖️ Activer les arbitres officiels</label>
         </div>
         <div style="display:flex;align-items:center;gap:8px;padding-top:6px">
-          <input type="checkbox" id="cfg_teamrefon" style="width:auto" oninput="onCfgChange()">
+          <input type="checkbox" id="cfg_teamrefon" style="width:auto" oninput="onRefFlagsChange()">
           <label for="cfg_teamrefon" style="margin:0;cursor:pointer">⚽ Activer l'arbitrage tournant par les équipes</label>
         </div>
         <div style="font-size:10px;color:var(--dim);padding-left:26px;max-width:520px">Poules : arbitrée par une équipe d'une <strong>autre poule</strong>. Phase finale : arbitrée par une équipe <strong>libre à cet horaire</strong>. Jamais sa propre équipe, rotation équilibrée automatique (réglable ensuite).</div>
@@ -5781,6 +5883,8 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
   <div class="flex g8 fw" style="margin-bottom:14px">
     <button class="btn btn-g" onclick="regeneratePoolSchedule()">🔄 Générer / Régénérer le calendrier</button>
     <button class="btn btn-ghost btn-sm" onclick="printPoolSchedule()">🖨 Imprimer le planning</button>
+    <button class="btn btn-ghost btn-sm" onclick="printMatchesByPool()">🖨 Matchs par poule</button>
+    <button class="btn btn-ghost btn-sm" onclick="printBracketByRound()">🖨 Phase finale par tour</button>
     <button class="btn btn-ghost btn-sm" onclick="printAllTeamSchedules()">🖨 Toutes les fiches équipes</button>
   </div>
 
