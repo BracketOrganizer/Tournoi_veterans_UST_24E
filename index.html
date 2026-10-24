@@ -26,7 +26,7 @@ import { getAuth, onAuthStateChanged, signInWithEmailAndPassword,
          createUserWithEmailAndPassword, signInWithPopup, GoogleAuthProvider,
          signOut, updateProfile, sendPasswordResetEmail }   from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js';
 import { getFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, onSnapshot, collection,
-         addDoc, updateDoc, serverTimestamp, query, orderBy }
+         addDoc, updateDoc, serverTimestamp, query, orderBy, where }
                                     from 'https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js';
 
 const firebaseConfig = {
@@ -408,10 +408,12 @@ onAuthStateChanged(auth, async (user)=>{
     subscribeToTournament();
     subscribeToMessages();
     watchOwnRole(CURRENT_USER.uid, RAW_DOC_ROLE);
+    if(isAdmin()) startRegWatch(); else stopRegWatch();
     if(USER_ROLE === 'manager' && MANAGER_TEAM_ID) subscribeToRoster(MANAGER_TEAM_ID);
   } else {
     CURRENT_USER = null; USER_ROLE = null; MANAGER_TEAM_ID = null; MANAGER_EXTRA_TEAM_IDS = []; MANAGER_VIEW_TEAM_ID = null; MANAGER_PENDING_REQUEST = null;
     stopRoleWatch();
+    stopRegWatch(); setRegPending(0);
     unsubAll(); // relance startLiveWatch() : ST.liveOpen reste à jour en continu
     showLogin();
   }
@@ -836,6 +838,7 @@ function refreshCurrentPage(){
     try { loadRegistrations(); } catch(e){ console.error('loadRegistrations (refresh)', e); }
   }
   updateRefereesBtnVisibility();
+  try { renderRegCounters(); } catch(e){}
   const refPanel = document.getElementById('refereesPanel');
   if(refPanel && refPanel.style.display!=='none'){
     try { renderRefereesPanel(); } catch(e){ console.error('renderRefereesPanel (refresh)', e); }
@@ -1732,6 +1735,7 @@ function applyRoleUI(){
   updateStepVisibility();
   updateFwdBtn();
   updateRefereesBtnVisibility();
+  try { renderRegCounters(); } catch(e){}
   updateTeamRefBtnVisibility();
   updateRegOpenBtn();
   if(isAdmin()){ try{ loadRegistrations(); }catch(e){} }
@@ -1950,15 +1954,58 @@ window.loadRegistrations = async function(){
     renderRegistrationsPanel(regs, extraRequests);
     renderRegOverview();
     renderRegClubs(managers);
-    const _pend = regs.filter(r=>r.regStatus==='pending').length + extraRequests.length;
+    const _pend = regs.filter(r=>r.regStatus==='pending').reduce((n,r)=>n+Math.max(1,regTeamNamesOf(r).length),0) + extraRequests.length;
     const _pb = document.getElementById('regPendingBadge'); if(_pb) _pb.textContent = _pend>0 ? `(${_pend} en attente)` : '';
-    updateRegBadge(_pend);
+    setRegPending(_pend);
   } catch(e){
     console.error('loadRegistrations', e);
     if(el) el.innerHTML=`<div class="info info-r" style="font-size:12px">Erreur de chargement : ${e.message}</div>`;
   }
 };
 
+// ══════════════════════════════════════════════════════════
+// COMPTEUR « Les inscriptions des équipes » (équipes en attente de validation)
+// ══════════════════════════════════════════════════════════
+let REG_PENDING_TEAMS = 0;
+let unsubRegWatch = null;
+function stopRegWatch(){ if(unsubRegWatch){ try { unsubRegWatch(); } catch(e){} unsubRegWatch = null; } }
+// Écoute en direct (Admin / Users) : inscriptions en ligne en attente + demandes d'équipe supplémentaire
+function startRegWatch(){
+  stopRegWatch();
+  if(!isAdmin()) return;
+  try {
+    unsubRegWatch = onSnapshot(query(collection(db,'users'), where('tournament','==',REG_TOURNAMENT_TAG)), snap=>{
+      let n = 0;
+      snap.forEach(d=>{
+        const u = d.data();
+        if(u.role==='registrant' && u.regStatus==='pending') n += Math.max(1, regTeamNamesOf(u).length);
+        else if(u.role==='manager' && u.pendingExtraTeamRequest) n += 1;
+      });
+      setRegPending(n);
+    }, err=>console.warn('startRegWatch', err));
+  } catch(e){ console.warn('startRegWatch', e); }
+}
+function setRegPending(n){ REG_PENDING_TEAMS = n||0; renderRegCounters(); }
+// Pastille orange (> 0) ou verte (0) : visible tant que les inscriptions sont ouvertes, ou s'il reste des équipes en attente
+function regCounterHTML(){
+  const n = REG_PENDING_TEAMS || 0, open = ST.registrationsOpen === true;
+  if(!open && n===0) return '';
+  const col = n>0 ? '#e67e00' : 'var(--grn)', bg = n>0 ? 'rgba(255,152,0,.15)' : 'var(--grn-bg)';
+  return `<span style="display:inline-flex;gap:6px;align-items:center;padding:5px 12px;border-radius:20px;border:1.5px solid ${col};background:${bg};color:${col};font-weight:700;font-size:13px">📥 Les inscriptions des équipes <span style="font-size:11px;font-weight:600">(${open?'ouvertes':'fermées'})</span> · <span style="font-size:15px">${n}</span> en attente</span>`;
+}
+function renderRegCounters(){
+  const n = REG_PENDING_TEAMS || 0;
+  ['adminBtn','drawerAdminBtn'].forEach(id=>{
+    const b = document.getElementById(id), sp = b && b.querySelector('.adm-badge');
+    if(!sp) return;
+    sp.textContent = n>99 ? '99+' : String(n);
+    sp.style.display = n>0 ? 'inline-block' : 'none';
+    sp.title = `${n} équipe${n>1?'s':''} en attente de validation`;
+  });
+  updateRegBadge(n);
+  const c = document.getElementById('teamsRegCounter'); if(c) c.innerHTML = regCounterHTML();
+  try { renderRegOverview(); } catch(e){}
+}
 function updateRegBadge(pendingCount){
   const btn = document.getElementById('regPanelBtn');
   if(!btn) return;
@@ -2043,6 +2090,7 @@ function renderRegOverview(){
   const el = document.getElementById('regOverview'); if(!el) return;
   const n = ST.cfg.n||24, c = ST.teams.length, lim = ST.cfg.maxTeamsPerClub||0;
   el.innerHTML = `<div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center">
+    ${regCounterHTML()}
     <span><b>${c} / ${n}</b> équipes inscrites (${Math.max(0,n-c)} place${n-c>1?'s':''} restante${n-c>1?'s':''})</span>
     <span>Inscriptions en ligne : <b style="color:${ST.registrationsOpen?'var(--grn)':'var(--red)'}">${ST.registrationsOpen?'🟢 ouvertes':'🔴 fermées'}</b>
       <button class="btn btn-ghost btn-xs" onclick="toggleRegistrationsOpen()">${ST.registrationsOpen?'Fermer':'Ouvrir'}</button></span>
@@ -3360,6 +3408,7 @@ window.saveCfgAndNext = async function(){
   const cfg=getCfg(); ST.cfg=cfg;
   await saveTournament({ cfg });
   updateRefereesBtnVisibility();
+  try { renderRegCounters(); } catch(e){}
   updateTeamRefBtnVisibility();
   goTo(2);
 };
@@ -5440,6 +5489,9 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
   div:has(> #cfg_refon), div:has(> #cfg_teamrefon){ gap:12px!important; padding:10px 12px!important; background:var(--s2); border:1px solid var(--bdr); border-radius:10px; margin-bottom:6px; }
 }
 
+/* Pastille rouge « inscriptions en attente » sur le bouton Admin */
+.adm-badge{ display:none; min-width:19px; height:19px; padding:0 6px; margin-left:7px; border-radius:10px; background:#e53935; color:#fff; font:700 11px/19px 'Exo 2',Arial,sans-serif; text-align:center; letter-spacing:0; box-shadow:0 0 0 2px rgba(255,255,255,.85); vertical-align:middle; }
+
 /* ── ADAPTATION MOBILE (≤ 767px) — ne change rien sur ordinateur / TV ───── */
 @media(max-width:767px){
   .wrap{ padding:14px 10px 80px; }
@@ -5640,7 +5692,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
     <button class="hdr-btn" id="ruleBtn" onclick="toggleRules()">📋 Règlement</button>
     <button class="hdr-btn" id="liveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
     <button class="hdr-btn" id="tvBtn" data-role="scorer" onclick="goTo('TV')" style="display:none">📺 Écran</button>
-    <button class="hdr-btn" id="adminBtn" data-role="admin" onclick="toggleAdminPanel()" style="display:none">👑 Admin</button>
+    <button class="hdr-btn" id="adminBtn" data-role="admin" onclick="toggleAdminPanel()" style="display:none">👑 Admin<span class="adm-badge"></span></button>
     <button class="hdr-btn" id="managerBtn" data-role="manager" onclick="goTo('M')" style="display:none">🛡️ Mon équipe</button>
     <button class="hdr-btn" id="backBtn" style="display:none" onclick="goBack()">← Retour</button>
     <button class="hdr-btn" id="fwdBtn" style="display:none" onclick="goFwd()">Suivant →</button>
@@ -5654,7 +5706,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
   <button class="hdr-drawer-btn" id="drawerRuleBtn" onclick="toggleRules();closeMobileMenu()">📋 Règlement</button>
   <button class="hdr-drawer-btn" id="drawerLiveBtn" data-role="scorer" onclick="goToLive()" style="display:none">📺 Live</button>
   <button class="hdr-drawer-btn" id="drawerTvBtn" data-role="scorer" onclick="goTo('TV');closeMobileMenu()" style="display:none">📺 Écran</button>
-  <button class="hdr-drawer-btn" id="drawerAdminBtn" data-role="admin" onclick="toggleAdminPanel();closeMobileMenu()" style="display:none">👑 Admin</button>
+  <button class="hdr-drawer-btn" id="drawerAdminBtn" data-role="admin" onclick="toggleAdminPanel();closeMobileMenu()" style="display:none">👑 Admin<span class="adm-badge"></span></button>
   <button class="hdr-drawer-btn" id="drawerManagerBtn" data-role="manager" onclick="goTo('M');closeMobileMenu()" style="display:none">🛡️ Mon équipe</button>
   <div class="hdr-drawer-sep"></div>
   <button class="hdr-drawer-btn" id="drawerBackBtn" onclick="goBack();closeMobileMenu()" style="display:none">← Retour</button>
@@ -5916,7 +5968,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
 <div class="page" id="page2">
 <div class="wrap">
   <div class="sec-ttl">👥 Équipes & Tirage des poules</div>
-  <div class="info info-b" style="font-size:12px;margin-bottom:10px" data-role="admin">💡 Pour inscrire un club avec ses équipes <b>et</b> créer l'accès du responsable (feuilles d'équipe), ou valider des inscriptions en ligne : panneau <b>👑 Admin → 🏟️ Inscription des équipes</b>.</div>
+  <div class="info info-b" style="font-size:12px;margin-bottom:10px" data-role="admin">💡 Pour inscrire un club avec ses équipes <b>et</b> créer l'accès du responsable (feuilles d'équipe), ou valider des inscriptions en ligne : panneau <b>👑 Admin → 🏟️ Inscription des équipes</b>.<div id="teamsRegCounter" style="margin-top:6px"></div></div>
 
   <div class="card">
     <div class="card-ttl">
