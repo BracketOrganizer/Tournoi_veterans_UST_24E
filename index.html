@@ -101,6 +101,7 @@ const ST = {
   // Arbitrage tournant par les équipes (alternative/complément aux arbitres
   // officiels ci-dessus) : { 'pool-M': teamId, 'bracket-M': teamId, ... }
   teamRefereeAssignments:{},
+  teamRefereeSubs:{},
   clubOverrides:{},
   cfg:{
     n:24,
@@ -750,7 +751,7 @@ function subscribeToTournament(){
     setDataReady(true); // même si le document n'existe pas : on sait alors qu'il n'y a rien
     if(!snap.exists()) return;
     const data=snap.data();
-    if(data.cfg)             ST.cfg             = data.cfg;
+    if(data.cfg){ ST.cfg = data.cfg; if(ST.cfg.refereesEnabled && ST.cfg.teamRefereeingEnabled) ST.cfg.teamRefereeingEnabled = false; } // anciennes configs : jamais les deux à la fois
     if(data.teams)           ST.teams           = data.teams;
     if(data.pools)           ST.pools           = data.pools;
     if(data.poolSchedule)    ST.poolSchedule    = data.poolSchedule;
@@ -764,6 +765,7 @@ function subscribeToTournament(){
     if(data.referees)        ST.referees        = Array.isArray(data.referees) ? data.referees : [];
     ST.refereeAssignments = sanitizeRefereeAssignments(data.refereeAssignments);
     ST.teamRefereeAssignments = sanitizeTeamRefereeAssignments(data.teamRefereeAssignments);
+    ST.teamRefereeSubs = sanitizeTeamRefereeAssignments(data.teamRefereeSubs);
     ST.clubOverrides = sanitizeClubOverrides(data.clubOverrides);
     ST.registrationsOpen = data.registrationsOpen === true;
     updateRegOpenBtn();
@@ -2631,6 +2633,49 @@ window.swapCourts = function(phaseKey, courtA, courtB){
   refreshCurrentPage();
 };
 
+// ── Répartition automatique des arbitres officiels sur les terrains ─────────────
+// Chaque terrain reçoit « refereesPerCourt » arbitres (sans doublon dans une phase). La phase finale est décalée d'un rang
+// pour que les arbitres changent de terrain. Ensuite, chaque case reste modifiable / les terrains inversables à la main.
+function distributeRefereesFor(phaseKey, refs, shift){
+  const courts = ST.cfg.courts||4;
+  const perCourt = Math.min(4,Math.max(1,ST.cfg.refereesPerCourt||1));
+  const n = refs.length, rot = n ? (shift % n) : 0;
+  const ordered = refs.slice(rot).concat(refs.slice(0,rot));
+  const out = {}; for(let c=1;c<=courts;c++) out[c] = [];
+  let k = 0;
+  for(let s=0;s<perCourt;s++) for(let c=1;c<=courts;c++){ out[c][s] = k<ordered.length ? ordered[k] : ''; k++; }
+  Object.keys(out).forEach(c=>{ while(out[c].length && !out[c][out[c].length-1]) out[c].pop(); });
+  return out;
+}
+function shuffleCopy(a){ const r=a.slice(); for(let i=r.length-1;i>0;i--){ const j=Math.floor(Math.random()*(i+1)); [r[i],r[j]]=[r[j],r[i]]; } return r; }
+window.autoAssignReferees = function(random){
+  if(!isAdmin()) return;
+  const refs = refList().slice();
+  if(!refs.length){ alert("Ajoutez d'abord des arbitres à la liste."); return; }
+  const courts = ST.cfg.courts||4, perCourt = Math.min(4,Math.max(1,ST.cfg.refereesPerCourt||1)), slots = courts*perCourt;
+  const hasExisting = ['pools','bracket'].some(p=>Object.values((ST.refereeAssignments||{})[p]||{}).some(a=>(a||[]).some(Boolean)));
+  if(hasExisting && !confirm("Remplacer les affectations actuelles par une nouvelle répartition ?\n\n(Vous pourrez ensuite modifier chaque case ou inverser deux terrains à la main.)")) return;
+  const poolsRefs   = random ? shuffleCopy(refs) : refs;
+  const bracketRefs = random ? shuffleCopy(refs) : refs;
+  ST.refereeAssignments = {
+    pools:   distributeRefereesFor('pools',   poolsRefs,   0),
+    bracket: distributeRefereesFor('bracket', bracketRefs, random ? 0 : (refs.length>1 ? 1 : 0))
+  };
+  saveTournament({ refereeAssignments: ST.refereeAssignments });
+  renderRefereesPanel();
+  refreshCurrentPage();
+  const filled = Math.min(refs.length, slots);
+  alert(`✅ Arbitres répartis : ${filled} case${filled>1?'s':''} sur ${slots} (poules et phase finale)` + (refs.length>slots ? `\n${refs.length-slots} arbitre${refs.length-slots>1?'s':''} en réserve (non affecté${refs.length-slots>1?'s':''}).` : '') + (refs.length<slots ? `\n${slots-refs.length} case${slots-refs.length>1?'s':''} reste${slots-refs.length>1?'nt':''} vide${slots-refs.length>1?'s':''} (pas assez d'arbitres).` : ''));
+};
+window.clearRefereeAssignments = function(){
+  if(!isAdmin()) return;
+  if(!confirm('Vider toutes les affectations d\'arbitres (poules et phase finale) ?')) return;
+  const courts = ST.cfg.courts||4, empty = {}; for(let c=1;c<=courts;c++) empty[c] = [];
+  ST.refereeAssignments = { pools:{...empty}, bracket:{...empty} };
+  saveTournament({ refereeAssignments: ST.refereeAssignments });
+  renderRefereesPanel(); refreshCurrentPage();
+};
+
 function renderRefereesPanel(){
   if(!isAdmin()) return;
   const el = document.getElementById('refereesPanelBody');
@@ -2694,6 +2739,12 @@ function renderRefereesPanel(){
       </div>
     </div>
     <div style="margin-bottom:8px">${listHTML}</div>
+    <div style="margin:6px 0 4px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+      <button class="btn btn-g btn-sm" onclick="autoAssignReferees(false)">🎲 Répartir automatiquement</button>
+      <button class="btn btn-ghost btn-sm" onclick="autoAssignReferees(true)">🔀 Mélanger au hasard</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearRefereeAssignments()">🧹 Vider</button>
+    </div>
+    <div style="font-size:11px;color:var(--muted);margin-bottom:6px">Répartit les arbitres sur les terrains, poules et phase finale, sans doublon. Ensuite, changez un arbitre dans une case ou inversez deux terrains à la main.</div>
     ${phaseGrid('pools','🏊 Phase de poules')}
     ${swapTool('pools','poules')}
     ${phaseGrid('bracket','🏆 Phase finale')}
@@ -2812,6 +2863,7 @@ function updateTeamRefBtnVisibility(){
   const btn = document.getElementById('teamRefBtn');
   const on = !!(ST.cfg && ST.cfg.teamRefereeingEnabled);
   if(btn) btn.style.display = on ? '' : 'none';
+  const pb = document.getElementById('planTeamRefBtn'); if(pb) pb.style.display = (on && isAdmin()) ? '' : 'none'; // bouton du Planning (Admin / Users)
   if(!on){
     const p = document.getElementById('teamRefPanel');
     if(p) p.style.display = 'none';
@@ -2955,6 +3007,55 @@ window.setTeamReferee = function(key, teamId){
   refreshCurrentPage();
 };
 
+// ── Remplaçants des arbitres d'équipe (arbitre du club absent / blessé) ─────────
+// ST.teamRefereeSubs = { 'team:<teamId>': 'Nom' (tous les matchs de l'équipe), '<clé du match>': '<teamId>::Nom' (un seul match) }
+// (valeur '' = pas de remplaçant : on n'efface jamais la clé car Firestore fusionne les objets)
+function teamRefSub(key, teamId){
+  const subs = ST.teamRefereeSubs || {};
+  const mv = subs[key];
+  if(mv){ const i = mv.indexOf('::'); if(i>0 && mv.slice(0,i)===teamId && mv.slice(i+2)) return mv.slice(i+2); }
+  return subs['team:'+teamId] || '';
+}
+function matchSubValue(key, teamId){
+  const mv = (ST.teamRefereeSubs||{})[key]; if(!mv || !teamId) return '';
+  const i = mv.indexOf('::'); return (i>0 && mv.slice(0,i)===teamId) ? mv.slice(i+2) : '';
+}
+window.setTeamRefSub = function(key, name){
+  if(!isAdmin()) return;
+  name = (name||'').trim();
+  if(!ST.teamRefereeSubs) ST.teamRefereeSubs = {};
+  if(key.startsWith('team:')) ST.teamRefereeSubs[key] = name;
+  else { const t = (ST.teamRefereeAssignments||{})[key]; ST.teamRefereeSubs[key] = (name && t) ? (t+'::'+name) : ''; }
+  saveTournament({ teamRefereeSubs: ST.teamRefereeSubs });
+  renderTeamRefPanel();
+  refreshCurrentPage();
+};
+function teamSubsHTML(){
+  const A = ST.teamRefereeAssignments || {}, count = {};
+  Object.values(A).forEach(id=>{ if(id) count[id] = (count[id]||0)+1; });
+  const ids = Object.keys(count).sort((x,y)=>tName(x).localeCompare(tName(y)));
+  if(!ids.length) return '';
+  const rows = ids.map(id=>`<div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;font-size:12px;margin-bottom:4px">
+      <span style="min-width:180px"><strong>${regEsc(tName(id))}</strong> <span style="color:var(--dim)">(${count[id]} match${count[id]>1?'s':''})</span></span>
+      <input type="text" value="${regEsc((ST.teamRefereeSubs||{})['team:'+id]||'')}" placeholder="Nom du remplaçant" onchange="setTeamRefSub('team:${id}',this.value)" style="width:230px">
+    </div>`).join('');
+  return `<details style="margin:10px 0;border:1px solid var(--bdr);border-radius:8px;padding:8px 12px">
+    <summary style="cursor:pointer;font-weight:700;font-size:12px">🔁 Remplacer l'arbitre d'une équipe (absent ou blessé)</summary>
+    <div style="font-size:11px;color:var(--muted);margin:6px 0 8px">Le nom saisi remplace l'arbitre de l'équipe sur <b>tous ses matchs</b>. Pour un seul match, utilisez le champ « Remplaçant » sur la ligne du match. Videz le champ pour revenir à l'arbitre du club.</div>
+    ${rows}</details>`;
+}
+// Bouton du planning : (re)génère les arbitrages par équipe
+window.generateTeamRefFromPlanning = function(){
+  if(!isAdmin()) return;
+  if(!(ST.cfg && ST.cfg.teamRefereeingEnabled)){ alert("Activez d'abord l'arbitrage tournant par les équipes dans la page Configuration."); return; }
+  if(!ST.poolSchedule.length){ alert("Générez d'abord le planning des poules."); return; }
+  generateTeamRefereeAssignments();
+  const A = ST.teamRefereeAssignments || {};
+  const poolN = ST.poolSchedule.filter(m=>A['pool-'+m.matchId]).length;
+  const otherTotal = ST.bracketSchedule.length, otherN = ST.bracketSchedule.filter(b=>A['bracket-'+b.m]).length;
+  alert(`✅ Arbitrages mis à jour : ${poolN}/${ST.poolSchedule.length} matchs de poules` + (otherTotal ? ` · ${otherN}/${otherTotal} matchs de phase finale déjà déterminés` : '') + '.\nVous pouvez modifier un arbitre ou saisir un remplaçant dans Admin → Arbitrage par équipe.');
+};
+
 function renderTeamRefPanel(){
   if(!isAdmin()) return;
   const el = document.getElementById('teamRefPanelBody');
@@ -2974,6 +3075,7 @@ function renderTeamRefPanel(){
         <option value="">— aucune —</option>
         ${teamRefOptionsHTML(options, current, m.time)}
       </select>
+      <input type="text" value="${regEsc(matchSubValue(key,current))}" placeholder="Remplaçant (ce match)" title="Nom d'un remplaçant pour ce match uniquement" onchange="setTeamRefSub('${key}',this.value)" style="width:150px;font-size:12px">
     </div>`;
   }).join('');
 
@@ -2994,6 +3096,7 @@ function renderTeamRefPanel(){
         <option value="">— aucune —</option>
         ${teamRefOptionsHTML(options, current, b.time)}
       </select>
+      <input type="text" value="${regEsc(matchSubValue(key,current))}" placeholder="Remplaçant (ce match)" title="Nom d'un remplaçant pour ce match uniquement" onchange="setTeamRefSub('${key}',this.value)" style="width:150px;font-size:12px">
     </div>`;
   }).join('');
 
@@ -3002,6 +3105,7 @@ function renderTeamRefPanel(){
       <button class="btn btn-g btn-sm" onclick="generateTeamRefereeAssignments()">🔄 Générer / mettre à jour les arbitrages</button>
       <div style="font-size:10px;color:var(--dim);margin-top:4px">L'équipe arbitre est choisie, quand c'est possible, parmi celles qui ne jouent pas au même moment. Relancez ce bouton après chaque tour de phase finale pour compléter les matchs nouvellement déterminés.</div>
     </div>
+    ${teamSubsHTML()}
     ${ST.poolSchedule.length ? `<div style="font-weight:700;font-size:12px;margin:10px 0 6px">🏊 Phase de poules</div>${poolRows}` : ''}
     ${ST.bracketSchedule.length ? `<div style="font-weight:700;font-size:12px;margin:14px 0 6px">🏆 Phase finale</div>${bracketRows}` : ''}
     ${(!ST.poolSchedule.length && !ST.bracketSchedule.length) ? `<div style="font-size:12px;color:var(--muted)">Le planning n'est pas encore généré.</div>` : ''}
@@ -3157,7 +3261,7 @@ function getCfg(){
     draw:           document.getElementById('cfg_draw')?.value||'order',
     refereesPerCourt: Math.min(4,Math.max(1,+(document.getElementById('cfg_refperc')?.value||1))),
     refereesEnabled: !!document.getElementById('cfg_refon')?.checked,
-    teamRefereeingEnabled: !!document.getElementById('cfg_teamrefon')?.checked,
+    teamRefereeingEnabled: !!document.getElementById('cfg_teamrefon')?.checked && !document.getElementById('cfg_refon')?.checked, // jamais les deux à la fois
     maxTeamsPerClub: +(document.getElementById('cfg_maxclub')?.value||0),
   };
 }
@@ -3182,7 +3286,7 @@ function renderCfgForm(){
   const refOnEl = document.getElementById('cfg_refon');
   if(refOnEl) refOnEl.checked = !!c.refereesEnabled;
   const teamRefOnEl = document.getElementById('cfg_teamrefon');
-  if(teamRefOnEl) teamRefOnEl.checked = !!c.teamRefereeingEnabled;
+  if(teamRefOnEl) teamRefOnEl.checked = !!c.teamRefereeingEnabled && !c.refereesEnabled; // jamais les deux à la fois
   setV('cfg_maxclub', c.maxTeamsPerClub||0);
   toggleRefPerCourtVisibility();
   _breaksDraft = (c.breaks && c.breaks.length) ? c.breaks.map(b=>({...b})) : [{ time:'12:00', duration:45, label:'Pause déjeuner' }];
@@ -3191,7 +3295,12 @@ function renderCfgForm(){
 }
 // Cases « arbitres officiels » / « arbitrage tournant » : enregistrées immédiatement, pour que les boutons
 // « Gérer les arbitres » et « Arbitrage par équipe » du panneau Admin fonctionnent tout de suite.
-window.onRefFlagsChange = function(){
+window.onRefFlagsChange = function(src){
+  // Exclusivité : une seule des deux options d'arbitrage à la fois (évite les doublons d'arbitrage)
+  if(src && src.checked){
+    const other = document.getElementById(src.id==='cfg_refon' ? 'cfg_teamrefon' : 'cfg_refon');
+    if(other && other.checked) other.checked = false;
+  }
   onCfgChange();
   const rOn = !!document.getElementById('cfg_refon')?.checked, tOn = !!document.getElementById('cfg_teamrefon')?.checked;
   if(!isAdmin()) return;
@@ -4438,8 +4547,11 @@ function matchCardHTML(type, matchId, aId, bId, r, subtitle, court, time, needsS
   // les équipes doivent savoir quand c'est à leur tour d'arbitrer.
   const teamRefKey = (type==='pool' ? 'pool-' : 'bracket-') + matchId;
   const teamRefId = ST.cfg?.teamRefereeingEnabled ? (ST.teamRefereeAssignments||{})[teamRefKey] : null;
+  const _teamRefSub = teamRefId ? teamRefSub(teamRefKey, teamRefId) : '';
   const teamRefLineHTML = teamRefId
-    ? `<div style="font-size:11px;color:var(--grn);margin-bottom:4px">⚽ Arbitrage : <strong>${tName(teamRefId)}</strong></div>` : '';
+    ? (_teamRefSub
+        ? `<div style="font-size:11px;color:var(--grn);margin-bottom:4px">⚽ Arbitrage : <strong>${regEsc(_teamRefSub)}</strong> <span style="color:var(--muted)">(remplace ${tName(teamRefId)})</span></div>`
+        : `<div style="font-size:11px;color:var(--grn);margin-bottom:4px">⚽ Arbitrage : <strong>${tName(teamRefId)}</strong></div>`) : '';
   let shootoutHTML='';
   if(needsShootout){
     const so=r.shootout||{};
@@ -5715,13 +5827,14 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
       </div>
       <div class="fr">
         <div style="display:flex;align-items:center;gap:8px;padding-top:6px">
-          <input type="checkbox" id="cfg_refon" style="width:auto" oninput="onRefFlagsChange()">
+          <input type="checkbox" id="cfg_refon" style="width:auto" oninput="onRefFlagsChange(this)">
           <label for="cfg_refon" style="margin:0;cursor:pointer">🧑‍⚖️ Activer les arbitres officiels</label>
         </div>
         <div style="display:flex;align-items:center;gap:8px;padding-top:6px">
-          <input type="checkbox" id="cfg_teamrefon" style="width:auto" oninput="onRefFlagsChange()">
+          <input type="checkbox" id="cfg_teamrefon" style="width:auto" oninput="onRefFlagsChange(this)">
           <label for="cfg_teamrefon" style="margin:0;cursor:pointer">⚽ Activer l'arbitrage tournant par les équipes</label>
         </div>
+        <div style="font-size:11px;color:var(--ylw);font-weight:600;padding-left:2px;flex-basis:100%">ℹ️ Une seule option à la fois : activer l'une désactive automatiquement l'autre (pour éviter les doublons d'arbitrage).</div>
         <div style="font-size:10px;color:var(--dim);padding-left:26px;max-width:520px">Poules : arbitrée par une équipe d'une <strong>autre poule</strong>. Phase finale : arbitrée par une équipe <strong>libre à cet horaire</strong>. Jamais sa propre équipe, rotation équilibrée automatique (réglable ensuite).</div>
       </div>
       <div class="fr">
@@ -5882,6 +5995,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
 
   <div class="flex g8 fw" style="margin-bottom:14px">
     <button class="btn btn-g" onclick="regeneratePoolSchedule()">🔄 Générer / Régénérer le calendrier</button>
+    <button class="btn btn-g btn-sm" id="planTeamRefBtn" style="display:none" onclick="generateTeamRefFromPlanning()">🔄 Générer / mettre à jour les arbitrages</button>
     <button class="btn btn-ghost btn-sm" onclick="printPoolSchedule()">🖨 Imprimer le planning</button>
     <button class="btn btn-ghost btn-sm" onclick="printMatchesByPool()">🖨 Matchs par poule</button>
     <button class="btn btn-ghost btn-sm" onclick="printBracketByRound()">🖨 Phase finale par tour</button>
