@@ -1535,6 +1535,7 @@ window.newTournament = async function(){
   ST.registrationsOpen = false;
   await saveTournament({ teams:[], pools:{A:[],B:[],C:[],D:[]}, poolSchedule:[], bracketSchedule:[], results:{}, phase:'pools', liveOpen:false, registrationsOpen:false });
   goTo(1);
+  try { resetRegManualForm(true); } catch(e){}
   const _msg = cleanRegistrationsReport(_clean);
   if(_clean.errors.length) alert(_msg); else alert(_msg + '\n\n✅ Nouveau tournoi prêt.');
   try { loadRegistrations(); } catch(e){}
@@ -1644,7 +1645,7 @@ window.submitRegistration = async function(){
   } catch(e){
     console.error('submitRegistration: création du compte', e);
     const map = {
-      'auth/email-already-in-use':'Cet email a déjà un compte. Utilisez un autre email ou contactez l\'organisation.',
+      'auth/email-already-in-use':'Cet email a déjà un compte. Si vous êtes déjà responsable d\'un club inscrit : fermez ce formulaire, connectez-vous avec cet email, puis demandez votre équipe supplémentaire depuis votre feuille d\'équipe (en bas de page). Sinon, utilisez un autre email ou contactez l\'organisation.',
       'auth/invalid-email':'Adresse email invalide.',
       'auth/weak-password':'Mot de passe trop faible (6 caractères minimum).',
       'auth/operation-not-allowed':'La connexion par email n\'est pas activée sur cette appli (à activer côté organisateur dans Firebase Authentication).',
@@ -2149,13 +2150,31 @@ function renderRegClubs(managers){
     </div>`;
   }).join('');
 }
+window.resetRegManualForm = function(clearMsg){
+  ['rm_club','rm_name','rm_email','rm_phone'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
+  const w = document.getElementById('rm_teams');
+  if(w) w.innerHTML = '<input type="text" class="rm_team" placeholder="Nom de l\'équipe 1" style="padding:8px 10px;border:1.5px solid var(--bdr);border-radius:8px;font-size:13px;width:100%">';
+  const pw = document.getElementById('rm_pwd'); if(pw) pw.value = genTempPassword();
+  const acc = document.getElementById('rm_account'); if(acc) acc.checked = true;
+  const pww = document.getElementById('rm_pwd_wrap'); if(pww) pww.style.display = '';
+  const b = document.getElementById('rm_addmode'); if(b){ b.style.display='none'; b.innerHTML=''; }
+  if(clearMsg){ const mm = document.getElementById('regManualMsg'); if(mm) mm.innerHTML = ''; }
+};
 window.prefillRegManual = function(club){
+  resetRegManualForm();
+  const mm = document.getElementById('regManualMsg'); if(mm) mm.innerHTML = '';
   const d = document.getElementById('rm_club')?.closest('details');
   if(d){ d.open = true; d.scrollIntoView({ behavior:'smooth', block:'start' }); }
   const ref = ST.teams.find(t=>(t.club||t.name||'').trim().toLowerCase()===(club||'').trim().toLowerCase());
   const set=(id,v)=>{ const e=document.getElementById(id); if(e) e.value=v||''; };
   set('rm_club', club); if(ref){ set('rm_name', ref.respNom); set('rm_email', ref.respEmail); set('rm_phone', ref.respTel); }
-  document.getElementById('rm_team_first')?.focus();
+  const lim = effectiveClubLimit(club), cnt = countTeamsByClub(club);
+  const b = document.getElementById('rm_addmode');
+  if(b){
+    b.style.display = '';
+    b.innerHTML = `➕ Ajout d'une équipe pour <b>${regEsc(club)}</b> (${cnt} déjà inscrite${cnt>1?'s':''}${lim>0?' · limite '+lim:''}). Saisissez simplement le nom de la nouvelle équipe ci-dessous puis « Inscrire » : le responsable existant sera rattaché automatiquement à cette équipe (son mot de passe ne change pas).`
+      + (lim>0 && cnt>=lim ? `<br>⚠️ Limite atteinte pour ce club : une confirmation vous proposera de l'augmenter.` : '');
+  }
   const f = document.querySelector('.rm_team'); if(f) f.focus();
 };
 window.addRmTeam = function(){
@@ -2214,7 +2233,7 @@ window.sendMgrReset = async function(email){
 window.submitManualRegistration = async function(){
   if(!isAdmin()){ alert('Réservé aux Admins / Users.'); return; }
   const msg = document.getElementById('regManualMsg');
-  const setMsg = (html, color)=>{ if(msg){ msg.style.color = color==='red'?'var(--red)':(color==='grn'?'var(--grn)':'var(--muted)'); msg.innerHTML = html; } };
+  const setMsg = (html, color)=>{ if(msg){ msg.style.color = color==='red'?'var(--red)':(color==='grn'?'var(--grn)':'var(--muted)'); msg.innerHTML = html; try{ msg.scrollIntoView({behavior:'smooth',block:'nearest'}); }catch(e){} } };
   const val = id => (document.getElementById(id)?.value||'').trim();
   const club = val('rm_club'), name = val('rm_name'), email = val('rm_email'), phone = val('rm_phone');
   const names = [...document.querySelectorAll('.rm_team')].map(i=>i.value.trim()).filter(Boolean);
@@ -2231,7 +2250,12 @@ window.submitManualRegistration = async function(){
   const slotsLeft = (ST.cfg.n||24) - ST.teams.length;
   if(names.length > slotsLeft){ setMsg(`Pas assez de places : ${Math.max(0,slotsLeft)} restante(s) pour ${names.length} équipe(s).`,'red'); return; }
   const lim = effectiveClubLimit(club), already = countTeamsByClub(club);
-  if(lim>0 && already+names.length > lim){ setMsg(`Limite du club atteinte : ${lim} équipe(s) max. (déjà ${already}). Changez la limite de ce club dans « Clubs et équipes inscrits » si besoin.`,'red'); return; }
+  if(lim>0 && already+names.length > lim){
+    if(!confirm(`Le club « ${club} » est limité à ${lim} équipe(s) (déjà ${already}).\n\nAutoriser ${already+names.length} équipes pour ce club ?`)){ setMsg(`Limite du club atteinte : ${lim} équipe(s) max. (déjà ${already}).`,'red'); return; }
+    if(!ST.clubOverrides) ST.clubOverrides = {};
+    ST.clubOverrides[club.trim().toLowerCase()] = already+names.length;
+    await saveTournament({ clubOverrides: ST.clubOverrides });
+  }
   const btn = document.getElementById('rm_submit'); if(btn) btn.disabled = true;
   setMsg('⏳ Inscription en cours…');
   try {
@@ -2253,9 +2277,7 @@ window.submitManualRegistration = async function(){
       }
     }
     setMsg(html, 'grn');
-    ['rm_club','rm_name','rm_email','rm_phone'].forEach(id=>{ const e=document.getElementById(id); if(e) e.value=''; });
-    const w = document.getElementById('rm_teams'); if(w) w.innerHTML = '<input type="text" class="rm_team" placeholder="Nom de l\'équipe 1" style="padding:8px 10px;border:1.5px solid var(--bdr);border-radius:8px;font-size:13px;width:100%">';
-    const pw = document.getElementById('rm_pwd'); if(pw) pw.value = genTempPassword();
+    resetRegManualForm();
     renderTeamsPage();
     loadRegistrations();
   } catch(e){
@@ -5747,6 +5769,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
     <details style="margin-top:10px;border:1px solid var(--bdr);border-radius:8px;padding:8px 12px">
       <summary style="cursor:pointer;font-weight:700;font-size:13px">➕ Inscrire un club et ses équipes (par l'organisation)</summary>
       <div style="font-size:11px;color:var(--muted);margin:8px 0;line-height:1.6">À utiliser quand l'inscription en ligne est fermée (ou pour inscrire un club à la main). Saisissez le responsable et ses équipes : avec « Créer l'accès », le responsable pourra se connecter et remplir la feuille de chaque équipe.</div>
+      <div id="rm_addmode" style="display:none;font-size:12px;line-height:1.5;background:var(--grn-bg);border:1px solid var(--grn);border-radius:8px;padding:8px 10px;margin-bottom:8px"></div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:8px">
         <input type="text" id="rm_club" placeholder="Club / entreprise *" style="padding:8px 10px;border:1.5px solid var(--bdr);border-radius:8px;font-size:13px;width:100%">
         <input type="text" id="rm_name" placeholder="Nom du responsable *" style="padding:8px 10px;border:1.5px solid var(--bdr);border-radius:8px;font-size:13px;width:100%">
