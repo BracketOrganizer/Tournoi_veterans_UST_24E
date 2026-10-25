@@ -2573,7 +2573,7 @@ function toggleRefPerCourtVisibility(){
 // Affiche/masque le bouton "Gérer les arbitres" du panneau admin selon le
 // réglage cfg.refereesEnabled (case à cocher en page Config). Si le système
 // est désactivé, on masque aussi le panneau lui-même s'il était ouvert.
-function updateRefereesBtnVisibility(){
+function updateRefereesBtnVisibility(){ try{ updateRefProgBtn(); }catch(e){}
   const btn = document.getElementById('refArbitresBtn');
   const on = !!(ST.cfg && ST.cfg.refereesEnabled);
   if(btn) btn.style.display = on ? '' : 'none';
@@ -2823,6 +2823,202 @@ function renderRefereesPanel(){
   `;
 }
 
+// ══════════════════════════════════════════════════════════
+// PROGRAMMES DES ARBITRES (page Planning)
+// Actif uniquement si « arbitres officiels » OU « arbitrage tournant » est coché en Config.
+// Plusieurs fiches par feuille A4 (économie de papier) : choix 1/2/4/6/8/12, ou Auto.
+// ══════════════════════════════════════════════════════════
+const REFPROG = { cards:[], sel:new Set() };
+const REFPROG_LAYOUTS = {
+  1:{c:1,r:1,fs:12,lh:6.2}, 2:{c:1,r:2,fs:11,lh:5.4}, 4:{c:2,r:2,fs:10,lh:4.9},
+  6:{c:2,r:3,fs:9.5,lh:4.6}, 8:{c:2,r:4,fs:9,lh:4.2}, 12:{c:3,r:4,fs:8,lh:3.6}
+};
+function refProgMode(){
+  if(ST.cfg && ST.cfg.refereesEnabled) return 'officials';
+  if(ST.cfg && ST.cfg.teamRefereeingEnabled) return 'teams';
+  return null;
+}
+function updateRefProgBtn(){
+  const on = !!refProgMode() && isScorer();
+  const b = document.getElementById('planRefProgBtn'); if(b) b.style.display = on ? '' : 'none';
+  if(!on){ const m = document.getElementById('refProgModal'); if(m) m.style.display = 'none'; }
+}
+async function refProgBuildCards(){
+  const mode = refProgMode(), cards = [];
+  if(mode==='officials'){
+    refList().forEach(name=>{
+      const rows = buildRefereeProgram(name).map(r=>({ time:r.time||'', court:r.court||'', phase:r.phase||'', a:r.a, b:r.b, note:'' }));
+      cards.push({ icon:'🧑‍⚖️', title:name, sub:'', rows });
+    });
+  } else if(mode==='teams'){
+    await Promise.all((ST.teams||[]).map(t=>Promise.resolve(getRosterOnce(t.id)).catch(()=>null)));
+    const A = ST.teamRefereeAssignments || {}, by = {};
+    const add = (tid, key, row)=>{ if(!tid || !tObj(tid)) return; row.note = teamRefSub(key, tid) ? 'remplaçant : '+teamRefSub(key, tid) : ''; (by[tid] = by[tid] || []).push(row); };
+    ST.poolSchedule.forEach(m=>{ const key = 'pool-'+m.matchId; add(A[key], key, { time:m.time||'', court:'T'+m.court, phase:'Poule '+m.pool, a:tName(m.a), b:tName(m.b) }); });
+    // Phase finale : selon l'appli, « bracketSchedule » (clé bracket-N) ou « groupSchedule » (tableaux, clé group-ID)
+    if(typeof bracketTeam==='function') (ST.bracketSchedule||[]).forEach(b=>{
+      const key = 'bracket-'+b.m, ta = bracketTeam(b.m,'a'), tb = bracketTeam(b.m,'b');
+      add(A[key], key, { time:b.time||'', court:'T'+b.court, phase:bracketLabel(b.m), a:ta?tName(ta):'à déterminer', b:tb?tName(tb):'à déterminer' });
+    });
+    if(typeof getBracketMatchTeams==='function') (ST.groupSchedule||[]).forEach(gm=>{
+      const key = 'group-'+gm.matchId, t = getBracketMatchTeams(gm);
+      add(A[key], key, { time:gm.time||'', court:'T'+gm.court, phase:bracketRoundLabel(gm.round)+' — '+BRACKET_LABELS[gm.bracket], a:t.a?tName(t.a):'à déterminer', b:t.b?tName(t.b):'à déterminer' });
+    });
+    Object.keys(by).forEach(tid=>{
+      const names = ((ROSTERS[tid]||{}).referees||[]).map(s=>String(s||'').trim()).filter(Boolean);
+      const teamSub = (ST.teamRefereeSubs||{})['team:'+tid] || '';
+      let sub = names.length ? 'Arbitre(s) : '+names.join(', ') : 'Arbitre(s) non renseigné(s) sur la feuille d’équipe';
+      if(teamSub) sub += ' · remplaçant : '+teamSub;
+      cards.push({ icon:'⚽', title:tName(tid), sub, rows:by[tid] });
+    });
+  }
+  cards.forEach(c=>c.rows.sort((x,y)=>(x.time||'').localeCompare(y.time||'') || (x.court||'').localeCompare(y.court||'')));
+  cards.sort((x,y)=>x.title.localeCompare(y.title,'fr'));
+  return cards;
+}
+// Hauteur nécessaire d'une fiche (mm) pour une mise en page donnée, en tenant compte du retour à la ligne des noms
+function refProgNeed(N, c){
+  const L = REFPROG_LAYOUTS[N], g = 3, cw = (194-(L.c-1)*g)/L.c;
+  const head = (N>=8 ? 11 : 13) + (c.sub ? 3 : 0);
+  const mcol = cw - 4 - 17, charW = L.fs*0.2646*0.52;
+  let h = head;
+  if(!c.rows.length) return h + L.lh;
+  c.rows.forEach(r=>{
+    const len = (r.phase+' '+r.a+' – '+r.b+(r.note?' ('+r.note+')':'')).length;
+    h += Math.max(1, Math.ceil(len*charW/mcol)) * L.lh;
+  });
+  return h;
+}
+function refProgFits(N, cards){
+  const L = REFPROG_LAYOUTS[N], ch = (281-(L.r-1)*3)/L.r;
+  return cards.every(c=>refProgNeed(N, c) <= ch);
+}
+function refProgAutoN(cards){
+  for(const N of [12,8,6,4,2,1]) if(refProgFits(N, cards)) return N;
+  return 1;
+}
+function refProgSheetsHTML(cards, N){
+  const L = REFPROG_LAYOUTS[N], sheets = [];
+  for(let i=0;i<cards.length;i+=N) sheets.push(cards.slice(i,i+N));
+  const fiche = c=>`<div class="fiche"><div class="fh">${c.icon} ${regEsc(c.title)}</div>${c.sub?`<div class="fs">${regEsc(c.sub)}</div>`:''}${
+    c.rows.length
+      ? `<table><colgroup><col style="width:10mm"><col style="width:7mm"><col></colgroup><thead><tr><th>Heure</th><th>T.</th><th>Match</th></tr></thead><tbody>${
+          c.rows.map(r=>`<tr><td><b>${regEsc(r.time)}</b></td><td class="t">${regEsc(r.court)}</td><td><span class="ph">${regEsc(r.phase)}</span> <b>${regEsc(r.a)}</b> – <b>${regEsc(r.b)}</b>${r.note?` <i class="nt">(${regEsc(r.note)})</i>`:''}</td></tr>`).join('')
+        }</tbody></table>`
+      : `<div class="none">Aucun match affecté pour l’instant.</div>`
+  }</div>`;
+  const body = sheets.map(s=>`<div class="sheet" style="grid-template-columns:repeat(${L.c},1fr);grid-template-rows:repeat(${L.r},1fr)">${s.map(fiche).join('')}</div>`).join('');
+  const css = `*{box-sizing:border-box;margin:0;padding:0} body{font-family:Arial,sans-serif;font-size:${L.fs}px;padding:8px;background:#fff;color:#111}
+    .bar{padding:8px 10px;background:#f0f4fa;display:flex;gap:14px;align-items:center;flex-wrap:wrap;margin-bottom:8px;font-size:12px}
+    .btn{padding:6px 18px;background:#1a7a3a;color:#fff;border:none;border-radius:6px;cursor:pointer}
+    .sheet{display:grid;gap:3mm;width:194mm;height:281mm;margin:0 auto 6mm;break-after:page;page-break-after:always}
+    .sheet:last-child{break-after:auto;page-break-after:auto}
+    .fiche{border:.3mm solid #999;padding:1.5mm 2mm;min-height:0;break-inside:avoid;page-break-inside:avoid}
+    .fh{font-weight:700;font-size:${L.fs+2}px;padding-bottom:.8mm;border-bottom:.5mm solid #1a2540;margin-bottom:.8mm;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .fs{font-size:${Math.max(7,L.fs-1.5)}px;color:#555;margin-bottom:.8mm}
+    table{width:100%;border-collapse:collapse;table-layout:fixed} th{background:#1a2540;color:#fff;text-align:left;padding:.3mm 1mm;font-size:${Math.max(7,L.fs-1)}px}
+    td{padding:.4mm 1mm;border-bottom:.2mm solid #ddd;line-height:1.15;vertical-align:top;overflow-wrap:anywhere} td.t{color:#7040b0;font-weight:700}
+    .ph{font-size:${Math.max(6.5,L.fs-2)}px;color:#777} .nt{color:#a05a00} .none{color:#999;font-style:italic;padding:1mm}
+    @media print{ @page{size:A4;margin:8mm} .noprint{display:none!important} body{padding:0} .sheet{margin:0 auto} html{-webkit-print-color-adjust:exact;print-color-adjust:exact} th{background:#1a2540!important;color:#fff!important} }`;
+  return { body, css, sheets:sheets.length };
+}
+window.openRefProgram = async function(){
+  if(!isScorer()) return;
+  if(!refProgMode()){ alert('Cochez d’abord « arbitres officiels » ou « arbitrage tournant » dans la page Configuration.'); return; }
+  if(!ST.poolSchedule.length && !(ST.bracketSchedule||[]).length && !(ST.groupSchedule||[]).length){ alert('Générez d’abord le planning.'); return; }
+  const modal = document.getElementById('refProgModal'), body = document.getElementById('refProgBody');
+  if(!modal || !body) return;
+  modal.style.display = 'block';
+  body.innerHTML = '<div style="padding:14px;color:var(--muted)">Chargement…</div>';
+  try {
+    REFPROG.cards = await refProgBuildCards();
+    REFPROG.sel = new Set(REFPROG.cards.map((_,i)=>i));
+    refProgRender();
+  } catch(e){
+    console.error('openRefProgram', e);
+    body.innerHTML = `<div style="padding:12px;color:#c0281a">⚠️ Erreur : ${regEsc(e.message||String(e))}</div>`;
+  }
+};
+window.closeRefProgram = function(){ const m = document.getElementById('refProgModal'); if(m) m.style.display = 'none'; };
+function refProgRender(){
+  const el = document.getElementById('refProgBody'); if(!el) return;
+  const mode = refProgMode(), cards = REFPROG.cards;
+  const label = mode==='officials'
+    ? 'Arbitres officiels : chaque arbitre fait tous les matchs de son terrain (poules et phase finale).'
+    : 'Arbitrage tournant : une fiche par équipe qui arbitre, avec ses arbitres et ses matchs.';
+  if(!cards.length){
+    el.innerHTML = `<div style="font-size:12px;color:var(--muted);margin-bottom:8px">${label}</div>
+      <div class="info info-y">${mode==='officials' ? 'Aucun arbitre dans la liste : ajoutez-les via « Gérer les arbitres » (panneau Admin).' : 'Aucun arbitrage attribué : cliquez sur « Générer / mettre à jour les arbitrages ».'}</div>`;
+    return;
+  }
+  const rowsHTML = cards.map((c,i)=>`<div style="border:1px solid var(--bdr);border-radius:8px;padding:6px 10px;margin-bottom:6px">
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+        <label style="display:flex;align-items:center;gap:6px;cursor:pointer;flex:1;min-width:180px;margin:0">
+          <input type="checkbox" ${REFPROG.sel.has(i)?'checked':''} onchange="refProgToggle(${i},this.checked)">
+          <span style="font-weight:700">${c.icon} ${regEsc(c.title)}</span>
+          <span style="color:var(--muted);font-size:12px">· ${c.rows.length} match${c.rows.length>1?'s':''}</span>
+        </label>
+        <button class="btn btn-ghost btn-xs" onclick="refProgToggleView(${i})">👁 Voir</button>
+        <button class="btn btn-b btn-xs" onclick="refProgPrint([${i}],1)">🖨 Seul</button>
+      </div>
+      ${c.sub?`<div style="font-size:11px;color:var(--muted);margin:2px 0 0 24px">${regEsc(c.sub)}</div>`:''}
+      <div id="refProgView_${i}" style="display:none;margin-top:6px">${
+        c.rows.length ? `<table style="width:100%;border-collapse:collapse;font-size:12px"><thead><tr><th style="text-align:left">Heure</th><th style="text-align:left">Terrain</th><th style="text-align:left">Match</th></tr></thead><tbody>${
+          c.rows.map(r=>`<tr><td style="padding:3px 6px;border-top:1px solid var(--bdr)"><b>${regEsc(r.time)}</b></td><td style="padding:3px 6px;border-top:1px solid var(--bdr)">${regEsc(r.court)}</td><td style="padding:3px 6px;border-top:1px solid var(--bdr)"><span style="color:var(--muted)">${regEsc(r.phase)}</span> <b>${regEsc(r.a)}</b> – <b>${regEsc(r.b)}</b>${r.note?` <i style="color:#a05a00">(${regEsc(r.note)})</i>`:''}</td></tr>`).join('')
+        }</tbody></table>` : '<div style="font-size:12px;color:var(--muted)">Aucun match affecté pour l’instant.</div>'
+      }</div>
+    </div>`).join('');
+  el.innerHTML = `<div style="font-size:12px;color:var(--muted);margin-bottom:10px">${label}</div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+      <label style="font-size:12px;font-weight:700;margin:0">Fiches par feuille A4 :</label>
+      <select id="refProgN" onchange="refProgInfo()" style="width:auto">
+        <option value="auto">Auto (le plus économique)</option>
+        <option value="1">1 par feuille</option><option value="2">2 par feuille</option><option value="4">4 par feuille</option>
+        <option value="6">6 par feuille</option><option value="8">8 par feuille</option><option value="12">12 par feuille</option>
+      </select>
+      <button class="btn btn-ghost btn-sm" onclick="refProgAll(true)">☑ Tout cocher</button>
+      <button class="btn btn-ghost btn-sm" onclick="refProgAll(false)">☐ Tout décocher</button>
+      <button class="btn btn-g btn-sm" onclick="refProgPrint()">🖨 Imprimer la sélection</button>
+    </div>
+    <div id="refProgInfo" style="font-size:12px;margin-bottom:10px"></div>
+    ${rowsHTML}`;
+  refProgInfo();
+}
+function refProgSelected(){ return REFPROG.cards.filter((_,i)=>REFPROG.sel.has(i)); }
+function refProgChosenN(cards){
+  const v = document.getElementById('refProgN')?.value || 'auto';
+  return v==='auto' ? refProgAutoN(cards) : +v;
+}
+window.refProgInfo = function(){
+  const el = document.getElementById('refProgInfo'); if(!el) return;
+  const cards = refProgSelected();
+  if(!cards.length){ el.innerHTML = '<span style="color:var(--muted)">Aucune fiche sélectionnée.</span>'; return; }
+  const N = refProgChosenN(cards), sheets = Math.ceil(cards.length/N), fits = refProgFits(N, cards);
+  el.innerHTML = `📄 ${cards.length} fiche${cards.length>1?'s':''} → <b>${sheets} feuille${sheets>1?'s':''} A4</b> (${N} par feuille)`
+    + (fits ? '' : ` <span style="color:#c0281a">⚠️ Certaines fiches sont trop longues pour ${N} par feuille et risquent de déborder : choisissez « Auto » ou moins de fiches par feuille.</span>`);
+};
+window.refProgToggle = function(i, on){ if(on) REFPROG.sel.add(i); else REFPROG.sel.delete(i); refProgInfo(); };
+window.refProgAll = function(on){ REFPROG.sel = on ? new Set(REFPROG.cards.map((_,i)=>i)) : new Set(); refProgRender(); };
+window.refProgToggleView = function(i){ const e = document.getElementById('refProgView_'+i); if(e) e.style.display = (e.style.display==='none') ? '' : 'none'; };
+window.refProgPrint = function(idxList, forceN){
+  const cards = idxList ? idxList.map(i=>REFPROG.cards[i]).filter(Boolean) : refProgSelected();
+  if(!cards.length){ alert('Sélectionnez au moins une fiche.'); return; }
+  const N = forceN || refProgChosenN(cards);
+  const out = refProgSheetsHTML(cards, N);
+  const bar = `<div class="noprint bar"><strong>🧑‍⚖️ Programmes arbitres — ${cards.length} fiche${cards.length>1?'s':''} · ${out.sheets} feuille${out.sheets>1?'s':''} A4 (${N} par feuille)</strong><button class="btn" onclick="window.print()">🖨 Imprimer</button></div>`;
+  openPrintWindow('_refprog', 'Programmes arbitres', out.css, bar + out.body);
+};
+// « Tous les programmes » (panneau arbitres de la page Config) : même impression économique, tous les arbitres, mise en page Auto
+window.printAllRefereeSchedules = async function(){
+  if(!refProgMode()) return;
+  try {
+    REFPROG.cards = await refProgBuildCards();
+    REFPROG.sel = new Set(REFPROG.cards.map((_,i)=>i));
+    if(!REFPROG.cards.length){ alert('Aucun arbitre dans la liste.'); return; }
+    refProgPrint(null, refProgAutoN(REFPROG.cards));
+  } catch(e){ alert('Erreur : '+(e.message||e)); }
+};
+
 // ── Programme individuel d'un arbitre (pour impression) ─────────────────
 function buildRefereeProgram(name){
   const rows=[];
@@ -2882,7 +3078,7 @@ window.printRefereeScheduleSingle = function(name){
   win.document.close(); setTimeout(()=>win.print(),400);
 };
 
-window.printAllRefereeSchedules = function(){
+window._legacyPrintAllRefs = function(){
   const referees = refList();
   if(!referees.length){ alert('Aucun arbitre dans la liste.'); return; }
   const fiches = referees.map(name=>refereeScheduleFicheHTML(name));
@@ -2929,7 +3125,7 @@ function sanitizeTeamRefereeAssignments(ta){
   return out;
 }
 
-function updateTeamRefBtnVisibility(){
+function updateTeamRefBtnVisibility(){ try{ updateRefProgBtn(); }catch(e){}
   const btn = document.getElementById('teamRefBtn');
   const on = !!(ST.cfg && ST.cfg.teamRefereeingEnabled);
   if(btn) btn.style.display = on ? '' : 'none';
@@ -3565,7 +3761,7 @@ function renderPoolsPreview(){
 // ══════════════════════════════════════════════════════════
 // PAGE 3 — PLANNING (poules)
 // ══════════════════════════════════════════════════════════
-function renderPlanningPreview(){
+function renderPlanningPreview(){ try{ updateRefProgBtn(); }catch(e){}
   const el = document.getElementById('schedPreview'); if(!el) return;
   if(!ST.poolSchedule.length){ el.innerHTML='<div class="info info-y">Planning non encore généré.</div>'; return; }
   const bySlot = {};
@@ -6063,6 +6259,17 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
   </div>
 </div>
 
+<!-- ══ PROGRAMMES DES ARBITRES (sous-dossier du Planning) ══ -->
+<div id="refProgModal" style="display:none;position:fixed;inset:0;z-index:9500;background:rgba(0,0,0,.55);overflow:auto;padding:16px" onclick="if(event.target===this)closeRefProgram()">
+  <div style="max-width:780px;margin:0 auto;background:var(--s1);border:1px solid var(--bdr);border-radius:12px;padding:14px 16px">
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:6px">
+      <div style="font-weight:800;font-size:16px">🧑‍⚖️ Programmes des arbitres</div>
+      <button class="btn btn-ghost btn-sm" onclick="closeRefProgram()">✕ Fermer</button>
+    </div>
+    <div id="refProgBody"></div>
+  </div>
+</div>
+
 <!-- ══ PAGE 3 — PLANNING ══ -->
 <div class="page" id="page3">
 <div class="wrap">
@@ -6071,6 +6278,7 @@ label[for="cfg_refon"], label[for="cfg_teamrefon"]{ font-size:14px!important; te
   <div class="flex g8 fw" style="margin-bottom:14px">
     <button class="btn btn-g" onclick="regeneratePoolSchedule()">🔄 Générer / Régénérer le calendrier</button>
     <button class="btn btn-g btn-sm" id="planTeamRefBtn" style="display:none" onclick="generateTeamRefFromPlanning()">🔄 Générer / mettre à jour les arbitrages</button>
+    <button class="btn btn-b btn-sm" id="planRefProgBtn" style="display:none" onclick="openRefProgram()">🧑‍⚖️ Programmes arbitres</button>
     <button class="btn btn-ghost btn-sm" onclick="printPoolSchedule()">🖨 Imprimer le planning</button>
     <button class="btn btn-ghost btn-sm" onclick="printMatchesByPool()">🖨 Matchs par poule</button>
     <button class="btn btn-ghost btn-sm" onclick="printBracketByRound()">🖨 Phase finale par tour</button>
